@@ -3126,6 +3126,29 @@ void GDALTileIndexDataset::LoadOverviews()
                 aosNewOpenOptions.SetNameValue("@FACTOR",
                                                CPLSPrintf("%.17g", dfFactor));
             }
+            if (osDSName.empty())
+            {
+                // Implicit overview of this very dataset: inherit the open
+                // options that select and order the tiles (FILTER, SORT_FIELD,
+                // ...), otherwise the overview would describe the unfiltered
+                // mosaic, with a different extent than this dataset, and
+                // downsampled reads would land at the wrong place. Options
+                // defining the resolution are replaced by @FACTOR.
+                for (const auto &[pszKey, pszValue] : cpl::IterateNameValue(
+                         static_cast<CSLConstList>(GetOpenOptions())))
+                {
+                    if (EQUAL(pszKey, MD_RESX) || EQUAL(pszKey, MD_RESY) ||
+                        EQUAL(pszKey, MD_XSIZE) || EQUAL(pszKey, MD_YSIZE) ||
+                        EQUAL(pszKey, MD_GEOTRANSFORM) ||
+                        STARTS_WITH_CI(pszKey, "OVERVIEW_") ||
+                        STARTS_WITH_CI(pszKey, "@") ||
+                        aosNewOpenOptions.FetchNameValue(pszKey))
+                    {
+                        continue;
+                    }
+                    aosNewOpenOptions.SetNameValue(pszKey, pszValue);
+                }
+            }
             if (!osLyrName.empty())
             {
                 aosNewOpenOptions.SetNameValue("@LAYER", osLyrName.c_str());

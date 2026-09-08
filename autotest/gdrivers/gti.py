@@ -2433,6 +2433,73 @@ def test_gti_on_the_fly_warping_four_corner_footprint(tmp_vsimem):
     assert max(data) > 0
 
 
+def test_gti_filter_open_option_with_factor_overview(tmp_vsimem):
+    """A FILTER open option shrinks the mosaic to the selected tiles; the implicit
+    <Overview><Factor> levels must describe the same (filtered) mosaic, not the
+    unfiltered one, otherwise downsampled reads land at the wrong place."""
+
+    tiles = []
+    for i, val in enumerate((1, 2)):
+        fn = str(tmp_vsimem / f"t{i}.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(fn, 40, 40)
+        ds.SetGeoTransform([2 + 40 * i, 1, 0, 49, 0, -1])
+        ds.GetRasterBand(1).Fill(val)
+        ds = None
+        tiles.append(fn)
+    index_filename = str(tmp_vsimem / "index.gti.gpkg")
+    index_ds = ogr.GetDriverByName("GPKG").CreateDataSource(index_filename)
+    lyr = index_ds.CreateLayer("tiles")
+    lyr.CreateField(ogr.FieldDefn("location"))
+    lyr.CreateField(ogr.FieldDefn("cat", ogr.OFTInteger))
+    for i, fn in enumerate(tiles):
+        f = ogr.Feature(lyr.GetLayerDefn())
+        f["location"] = fn
+        f["cat"] = i + 1
+        x0 = 2 + 40 * i
+        f.SetGeometry(ogr.CreateGeometryFromWkt(
+            f"POLYGON(({x0} 9,{x0} 49,{x0 + 40} 49,{x0 + 40} 9,{x0} 9))"))
+        lyr.CreateFeature(f)
+    del index_ds
+    # Go through an OGR VRT layer over a SQL result set (as a PostGIS-backed index
+    # would): its extent honours the attribute filter, unlike a plain GPKG layer
+    # which answers from its metadata. shared="0": with a shared source the
+    # SQLite driver caches the extent per SQL string on the datasource, and the
+    # overview would silently reuse the parent's filtered extent.
+    vrt_filename = str(tmp_vsimem / "index.vrt")
+    gdal.FileFromMemBuffer(
+        vrt_filename,
+        f"""<OGRVRTDataSource>
+    <OGRVRTLayer name="tiles">
+        <SrcDataSource shared="0">{index_filename}</SrcDataSource>
+        <SrcSQL>SELECT * FROM tiles</SrcSQL>
+        <GeometryField encoding="Direct" field="geom" name="geom"/>
+    </OGRVRTLayer>
+</OGRVRTDataSource>""",
+    )
+    xml_filename = str(tmp_vsimem / "index.gti")
+    gdal.FileFromMemBuffer(
+        xml_filename,
+        f"""<GDALTileIndexDataset>
+    <IndexDataset>{vrt_filename}</IndexDataset>
+    <BandCount>1</BandCount><DataType>Byte</DataType><ResX>1</ResX><ResY>1</ResY>
+    <Overview><Factor>2</Factor></Overview>
+    <Overview><Factor>4</Factor></Overview>
+</GDALTileIndexDataset>""",
+    )
+
+    with gdal.quiet_errors():   # "Could get layer extent, but using a slower method"
+        ds = gdal.OpenEx(xml_filename, open_options=["FILTER=cat = 2"])
+    assert ds.RasterXSize == 40  # only the second tile
+    assert ds.GetGeoTransform()[0] == 42
+    with gdal.quiet_errors():
+        ovr = ds.GetRasterBand(1).GetOverview(0)
+    assert ovr.XSize == 20
+    assert ovr.GetDataset().GetGeoTransform()[0] == 42   # same (filtered) extent
+    # downsampled read of the whole (filtered) mosaic: the second tile everywhere
+    assert ds.GetRasterBand(1).ReadRaster(0, 0, 40, 40, 10, 10) == b"\x02" * 100
+    assert ovr.ReadRaster() == b"\x02" * 400
+
+
 def test_gti_single_source_alpha_no_dest_nodata(tmp_vsimem):
 
     filename1 = str(tmp_vsimem / "one.tif")
