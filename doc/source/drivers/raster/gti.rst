@@ -224,6 +224,26 @@ PostGIS, ...), the following layer metadata items may be set:
   it. Rectangular footprints are tested through their envelope; other polygons
   require GEOS. Defaults to NO.
 
+* ``TOP_DOWN_RENDERING=YES|NO``: whether tiles are composited from the highest
+  priority (as defined by SORT_FIELD) down, opened lazily, stopping as soon as
+  every pixel of the request window has received a valid value. Validity of a
+  tile pixel is given by its mask/alpha band when it has one, else by its
+  nodata value. Pixels of the top tile that are nodata or masked are filled
+  from the tiles beneath it, as with the default rendering, but tiles that are
+  entirely hidden are never opened, which makes requests over deep stacks of
+  overlapping tiles (e.g. time series) cost only the tiles needed to fill the
+  view. Tiles are opened and read ahead of the compositing by a thread pool
+  (see NUM_THREADS and TOP_DOWN_PREFETCH). Defaults to NO.
+
+* ``MAX_SOURCES_PER_REQUEST=<int>``: with TOP_DOWN_RENDERING, maximum number of
+  tiles composited for a request; remaining pixels are left to nodata. 0 means
+  unlimited. Defaults to 0.
+
+* ``TOP_DOWN_PREFETCH=AUTO|<int>``: with TOP_DOWN_RENDERING, number of tiles
+  read ahead of the compositing cursor by the thread pool. AUTO starts with one
+  tile and doubles it each time a tile leaves pixels unfilled, up to the number
+  of threads; 0 disables prefetching. Defaults to AUTO.
+
 * ``RESAMPLING=<val>``: Resampling method to use for on-the-fly reprojection,
   or rendering of tiles whose origin coordinates are not at an offset multiple
   of the resolution of the mosaic compared to the origin of the mosaic. In that
@@ -331,6 +351,9 @@ mentioned in the previous section.
         <SortField>pub_date</SortField>                <!-- optional -->
         <SortFieldAsc>true</SortFieldAsc>              <!-- optional -->
         <TrustFootprint>false</TrustFootprint>         <!-- optional -->
+        <TopDownRendering>false</TopDownRendering>     <!-- optional -->
+        <MaxSourcesPerRequest>0</MaxSourcesPerRequest> <!-- optional -->
+        <TopDownPrefetch>AUTO</TopDownPrefetch>        <!-- optional -->
         <SRS>EPSG:4326</SRS>                           <!-- optional -->
         <ResX>60</ResX>                                <!-- optional, but recommended -->
         <ResY>60</ResY>                                <!-- optional, but recommended -->
@@ -532,6 +555,27 @@ also defined as layer metadata items or in the .gti XML file
       tiles hidden under the footprint of a higher-priority tile that fully contains
       the request window are neither opened nor rendered.
       Same role as the TRUST_FOOTPRINT layer metadata item.
+
+-  .. oo:: TOP_DOWN_RENDERING
+      :choices: YES, NO
+      :default: NO
+
+      Composite tiles from the highest priority down, opening them lazily and
+      stopping as soon as the request window is filled.
+      Same role as the TOP_DOWN_RENDERING layer metadata item.
+
+-  .. oo:: MAX_SOURCES_PER_REQUEST
+      :choices: <integer>
+      :default: 0
+
+      With TOP_DOWN_RENDERING, maximum number of tiles composited per request (0 = unlimited).
+
+-  .. oo:: TOP_DOWN_PREFETCH
+      :choices: AUTO, <integer>
+      :default: AUTO
+
+      With TOP_DOWN_RENDERING, number of tiles read ahead of the compositing cursor
+      by the thread pool (0 disables prefetching).
 
 -  .. oo:: FILTER
       :choices: <string>

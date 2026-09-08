@@ -59,6 +59,9 @@
 
                     <xs:element name="MaskBand" type="OGRBooleanType"/>
                     <xs:element name="TrustFootprint" type="OGRBooleanType"/>
+                    <xs:element name="TopDownRendering" type="OGRBooleanType"/>
+                    <xs:element name="MaxSourcesPerRequest" type="nonNegativeInteger32"/>
+                    <xs:element name="TopDownPrefetch" type="xs:string"/>  <!-- AUTO or integer -->
 
                     <xs:element name="Band" type="BandType"/> <!-- may be repeated -->
                     <xs:element name="Overview" type="OverviewType"/>  <!-- may be repeated -->

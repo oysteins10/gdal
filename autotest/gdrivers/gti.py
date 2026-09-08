@@ -2094,6 +2094,309 @@ def test_gti_trust_footprint_reprojected_index(tmp_vsimem):
     assert _occluded(ds) == "1"
 
 
+###############################################################################
+# TOP_DOWN_RENDERING: progressive top-down compositing with lazy opening
+
+
+def _td_tile(filename, value, holes=(), kind="nodata", size=(20, 20), gt=(2, 1, 0, 49, 0, -1), bands=1):
+    """Tile filled with `value`; `holes` = list of (x, y, w, h) invalid areas,
+    either as nodata 0 (kind='nodata') or masked out (kind='mask')."""
+    with gdal.config_option("GDAL_TIFF_INTERNAL_MASK", "YES"):
+        ds = gdal.GetDriverByName("GTiff").Create(filename, size[0], size[1], bands)
+        ds.SetGeoTransform(list(gt))
+        for b in range(bands):
+            if kind == "nodata":
+                ds.GetRasterBand(b + 1).SetNoDataValue(0)
+            ds.GetRasterBand(b + 1).Fill(value + b)
+            for x, y, w, h in holes:
+                ds.GetRasterBand(b + 1).WriteRaster(x, y, w, h, b"\x00" * (w * h))
+        if kind == "mask":
+            ds.CreateMaskBand(gdal.GMF_PER_DATASET)
+            mb = ds.GetRasterBand(1).GetMaskBand()
+            mb.Fill(255)
+            for x, y, w, h in holes:
+                mb.WriteRaster(x, y, w, h, b"\x00" * (w * h))
+        ds = None
+    return filename
+
+
+def _td_index(tmp_vsimem, tiles, md=None, name="index.gti.gpkg", nodata="0"):
+    """tiles = [(location, prio, wkt)], lowest prio first. Declares the mosaic
+    characteristics so that opening the index opens no tile."""
+    index_filename = str(tmp_vsimem / name)
+    index_ds = ogr.GetDriverByName("GPKG").CreateDataSource(index_filename)
+    lyr = index_ds.CreateLayer("index")
+    lyr.CreateField(ogr.FieldDefn("location"))
+    lyr.CreateField(ogr.FieldDefn("prio", ogr.OFTInteger))
+    for location, prio, wkt in tiles:
+        f = ogr.Feature(lyr.GetLayerDefn())
+        f["location"] = location
+        f["prio"] = prio
+        f.SetGeometry(ogr.CreateGeometryFromWkt(wkt))
+        lyr.CreateFeature(f)
+    items = {
+        "SORT_FIELD": "prio", "BAND_COUNT": "1", "DATA_TYPE": "Byte",
+        "RESX": "1", "RESY": "1", "MINX": "2", "MINY": "29", "MAXX": "22", "MAXY": "49",
+    }
+    if nodata is not None:
+        items["NODATA"] = nodata
+    items.update(md or {})
+    for k, v in items.items():
+        lyr.SetMetadataItem(k, v)
+    del index_ds
+    return index_filename
+
+
+RECT = "POLYGON((2 29,2 49,22 49,22 29,2 29))"
+
+
+def _td_stack(tmp_vsimem, kind):
+    """bottom=1 (full), middle=2 (2x2 hole at 9,9), top=3 (4x4 hole at 8,8)"""
+    bottom = _td_tile(str(tmp_vsimem / "bottom.tif"), 1, kind=kind)
+    middle = _td_tile(str(tmp_vsimem / "middle.tif"), 2, holes=[(9, 9, 2, 2)], kind=kind)
+    top = _td_tile(str(tmp_vsimem / "top.tif"), 3, holes=[(8, 8, 4, 4)], kind=kind)
+    return bottom, middle, top
+
+
+def _td_open(index_filename, threads, extra=()):
+    return gdal.OpenEx(
+        index_filename,
+        open_options=["TOP_DOWN_RENDERING=YES", f"NUM_THREADS={threads}"] + list(extra),
+    )
+
+
+def _dbg(ds, item):
+    return ds.GetMetadataItem(item, "__DEBUG__")
+
+
+_TD_WINDOWS = [
+    (0, 0, 20, 20, 20, 20),
+    (0, 0, 20, 20, 10, 10),
+    (0, 0, 20, 20, 4, 4),
+    (5, 5, 10, 10, 10, 10),
+    (6, 6, 8, 8, 4, 4),
+    (7, 7, 6, 6, 12, 12),
+]
+
+
+@pytest.mark.parametrize("kind", ["nodata", "mask"])
+@pytest.mark.parametrize("threads", [1, 4])
+def test_gti_top_down_equivalence(tmp_vsimem, kind, threads):
+
+    bottom, middle, top = _td_stack(tmp_vsimem, kind)
+    md = {"MASK_BAND": "YES"} if kind == "mask" else {}
+    index_filename = _td_index(
+        tmp_vsimem, [(bottom, 1, RECT), (middle, 2, RECT), (top, 3, RECT)], md=md,
+        nodata="0" if kind == "nodata" else None,
+    )
+    ref_ds = gdal.Open(index_filename)
+    ds = _td_open(index_filename, threads)
+    for x, y, w, h, bw, bh in _TD_WINDOWS:
+        ref = ref_ds.GetRasterBand(1).ReadRaster(x, y, w, h, buf_xsize=bw, buf_ysize=bh)
+        got = ds.GetRasterBand(1).ReadRaster(x, y, w, h, buf_xsize=bw, buf_ysize=bh)
+        assert got == ref, (x, y, w, h, bw, bh)
+        if kind == "mask":
+            ref_m = ref_ds.GetRasterBand(1).GetMaskBand().ReadRaster(x, y, w, h, buf_xsize=bw, buf_ysize=bh)
+            got_m = ds.GetRasterBand(1).GetMaskBand().ReadRaster(x, y, w, h, buf_xsize=bw, buf_ysize=bh)
+            assert got_m == ref_m, ("mask", x, y, w, h, bw, bh)
+
+
+def test_gti_top_down_sees_through(tmp_vsimem):
+
+    bottom, middle, top = _td_stack(tmp_vsimem, "nodata")
+    index_filename = _td_index(tmp_vsimem, [(bottom, 1, RECT), (middle, 2, RECT), (top, 3, RECT)])
+    ds = _td_open(index_filename, 1)
+    data = ds.GetRasterBand(1).ReadRaster()
+    assert data[0] == 3
+    assert data[8 * 20 + 8] == 2  # top hole filled from middle
+    assert data[9 * 20 + 9] == 1  # nested hole filled from bottom
+    assert _dbg(ds, "TOP_DOWN_LAST_SOURCES_READ") == "3"
+    assert _dbg(ds, "TOP_DOWN_LAST_FILLED_RATIO") == "1.000000"
+    # window away from the holes: only the top tile is read
+    assert ds.GetRasterBand(1).ReadRaster(0, 0, 5, 5) == b"\x03" * 25
+    assert _dbg(ds, "TOP_DOWN_LAST_SOURCES_READ") == "1"
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+def test_gti_top_down_stops_when_filled(tmp_vsimem, threads):
+
+    top = _td_tile(str(tmp_vsimem / "top.tif"), 3)
+    missing1 = str(tmp_vsimem / "missing1.tif")
+    missing2 = str(tmp_vsimem / "missing2.tif")
+    index_filename = _td_index(tmp_vsimem, [(missing1, 1, RECT), (missing2, 2, RECT), (top, 3, RECT)])
+
+    # default rendering opens everything and fails
+    ref_ds = gdal.Open(index_filename)
+    with pytest.raises(Exception):
+        ref_ds.GetRasterBand(1).ReadRaster()
+    ref_ds = None
+
+    ds = _td_open(index_filename, threads, extra=["TOP_DOWN_PREFETCH=0"])
+    assert ds.GetRasterBand(1).ReadRaster() == b"\x03" * 400
+    assert _dbg(ds, "TOP_DOWN_LAST_SOURCES_READ") == "1"
+    assert _dbg(ds, "TOP_DOWN_LAST_SOURCES_PREFETCHED") == "1"
+
+    # AUTO prefetch with several threads speculatively opens the next (missing)
+    # tile: its failure is dropped since it is not needed
+    ds = _td_open(index_filename, threads)
+    assert ds.GetRasterBand(1).ReadRaster() == b"\x03" * 400
+    assert _dbg(ds, "TOP_DOWN_LAST_SOURCES_READ") == "1"
+    assert _dbg(ds, "TOP_DOWN_LAST_SOURCES_PREFETCHED") == ("2" if threads > 1 else "1")
+
+
+def test_gti_top_down_needed_failure_is_error(tmp_vsimem):
+
+    bottom, _, top = _td_stack(tmp_vsimem, "nodata")
+    missing = str(tmp_vsimem / "missing.tif")
+    index_filename = _td_index(tmp_vsimem, [(bottom, 1, RECT), (missing, 2, RECT), (top, 3, RECT)])
+    ds = _td_open(index_filename, 2)
+    # window away from the hole: the missing tile is never needed
+    assert ds.GetRasterBand(1).ReadRaster(0, 0, 5, 5) == b"\x03" * 25
+    # window over the hole: the missing tile is needed -> error
+    with pytest.raises(Exception):
+        ds.GetRasterBand(1).ReadRaster(8, 8, 4, 4)
+
+
+def test_gti_top_down_max_sources(tmp_vsimem):
+
+    bottom, middle, top = _td_stack(tmp_vsimem, "nodata")
+    index_filename = _td_index(tmp_vsimem, [(bottom, 1, RECT), (middle, 2, RECT), (top, 3, RECT)])
+    ds = _td_open(index_filename, 1, extra=["MAX_SOURCES_PER_REQUEST=1"])
+    data = ds.GetRasterBand(1).ReadRaster()
+    assert data[0] == 3
+    assert data[8 * 20 + 8] == 0  # hole left to nodata
+    assert _dbg(ds, "TOP_DOWN_LAST_SOURCES_READ") == "1"
+
+
+@pytest.mark.parametrize("threads", [1, 4])
+def test_gti_top_down_partial_windows(tmp_vsimem, threads):
+
+    bottom = _td_tile(str(tmp_vsimem / "bottom.tif"), 1)
+    # top covers only the left half (x in [2, 12]) with a hole
+    top = _td_tile(str(tmp_vsimem / "top.tif"), 3, holes=[(3, 3, 2, 2)], size=(10, 20))
+    index_filename = _td_index(
+        tmp_vsimem, [(bottom, 1, RECT), (top, 3, "POLYGON((2 29,2 49,12 49,12 29,2 29))")]
+    )
+    ref_ds = gdal.Open(index_filename)
+    ds = _td_open(index_filename, threads)
+    for x, y, w, h, bw, bh in _TD_WINDOWS + [(8, 0, 4, 20, 4, 20), (8, 0, 4, 20, 2, 10)]:
+        ref = ref_ds.GetRasterBand(1).ReadRaster(x, y, w, h, buf_xsize=bw, buf_ysize=bh)
+        got = ds.GetRasterBand(1).ReadRaster(x, y, w, h, buf_xsize=bw, buf_ysize=bh)
+        assert got == ref, (x, y, w, h, bw, bh)
+    assert ds.GetRasterBand(1).ReadRaster(8, 1, 4, 1) == b"\x03\x03\x01\x01"
+    assert _dbg(ds, "TOP_DOWN_LAST_SOURCES_READ") == "2"
+
+
+def test_gti_top_down_prefetch_depth(tmp_vsimem):
+
+    tiles = []
+    for i in range(6):
+        # each tile has a hole at a different place: several tiles are needed
+        tiles.append((_td_tile(str(tmp_vsimem / f"t{i}.tif"), 10 + i, holes=[(2 * i, 2 * i, 2, 2)]), i + 1, RECT))
+    index_filename = _td_index(tmp_vsimem, tiles)
+    ref_ds = gdal.Open(index_filename)
+    ref = ref_ds.GetRasterBand(1).ReadRaster()
+    ds = _td_open(index_filename, 4, extra=["TOP_DOWN_PREFETCH=3"])
+    assert ds.GetRasterBand(1).ReadRaster() == ref
+    nread = int(_dbg(ds, "TOP_DOWN_LAST_SOURCES_READ"))
+    nprefetched = int(_dbg(ds, "TOP_DOWN_LAST_SOURCES_PREFETCHED"))
+    assert nread >= 2
+    assert nread <= nprefetched <= min(6, nread + 3)
+
+
+def test_gti_top_down_with_trust_footprint(tmp_vsimem):
+
+    bottom, middle, top = _td_stack(tmp_vsimem, "nodata")
+    index_filename = _td_index(
+        tmp_vsimem, [(bottom, 1, RECT), (middle, 2, RECT), (top, 3, RECT)],
+        md={"TRUST_FOOTPRINT": "YES"},
+    )
+    ds = _td_open(index_filename, 2)
+    data = ds.GetRasterBand(1).ReadRaster()
+    assert data[0] == 3
+    assert data[8 * 20 + 8] == 0  # pruned by the footprint: hole not filled
+    assert _dbg(ds, "TRUST_FOOTPRINT_LAST_OCCLUDED") == "2"
+    assert _dbg(ds, "TOP_DOWN_LAST_SOURCES_READ") == "1"
+
+
+def test_gti_top_down_xml_and_overview(tmp_vsimem):
+
+    bottom, middle, top = _td_stack(tmp_vsimem, "nodata")
+    index_filename = _td_index(tmp_vsimem, [(bottom, 1, RECT), (middle, 2, RECT), (top, 3, RECT)])
+    xml_filename = str(tmp_vsimem / "index.gti")
+    gdal.FileFromMemBuffer(
+        xml_filename,
+        f"""<GDALTileIndexDataset>
+    <IndexDataset>{index_filename}</IndexDataset>
+    <TopDownRendering>true</TopDownRendering>
+    <TopDownPrefetch>2</TopDownPrefetch>
+    <Overview><Factor>2</Factor></Overview>
+</GDALTileIndexDataset>""",
+    )
+    ds = gdal.Open(xml_filename)
+    ref_ds = gdal.Open(index_filename)
+    ref = ref_ds.GetRasterBand(1).ReadRaster()
+    assert ds.GetRasterBand(1).ReadRaster() == ref
+    assert _dbg(ds, "TOP_DOWN_LAST_SOURCES_READ") == "3"
+    ovr_band = ds.GetRasterBand(1).GetOverview(0)
+    assert ovr_band.XSize == 10
+    ovr_band.ReadRaster()
+    assert int(_dbg(ovr_band.GetDataset(), "TOP_DOWN_LAST_SOURCES_READ")) >= 1
+
+
+def test_gti_top_down_non_overlapping_uses_mt(tmp_vsimem):
+
+    # two adjacent 1100x1100 tiles: the multi-threaded path (disjoint sources)
+    # must still be used for large requests
+    left = _td_tile(str(tmp_vsimem / "left.tif"), 1, size=(1100, 1100), gt=(0, 1, 0, 1100, 0, -1))
+    right = _td_tile(str(tmp_vsimem / "right.tif"), 2, size=(1100, 1100), gt=(1100, 1, 0, 1100, 0, -1))
+    index_filename = _td_index(
+        tmp_vsimem,
+        [(left, 1, "POLYGON((0 0,0 1100,1100 1100,1100 0,0 0))"),
+         (right, 2, "POLYGON((1100 0,1100 1100,2200 1100,2200 0,1100 0))")],
+        md={"MINX": "0", "MINY": "0", "MAXX": "2200", "MAXY": "1100"},
+    )
+    ds = _td_open(index_filename, 2)
+    data = ds.GetRasterBand(1).ReadRaster()
+    assert data[0] == 1 and data[1100 * 1100 * 2 - 1] == 2
+    assert _dbg(ds, "MULTI_THREADED_RASTERIO_LAST_USED") == "1"
+
+
+def test_gti_top_down_rgb_into_rgba(tmp_vsimem):
+
+    rgb = _td_tile(str(tmp_vsimem / "rgb.tif"), 10, holes=[(0, 0, 4, 4)], bands=3)
+    rgba_ds = gdal.GetDriverByName("GTiff").Create(str(tmp_vsimem / "rgba.tif"), 20, 20, 4)
+    rgba_ds.SetGeoTransform([2, 1, 0, 49, 0, -1])
+    for b in range(3):
+        rgba_ds.GetRasterBand(b + 1).Fill(20 + b)
+    rgba_ds.GetRasterBand(4).SetColorInterpretation(gdal.GCI_AlphaBand)
+    rgba_ds.GetRasterBand(4).Fill(255)
+    rgba_ds.GetRasterBand(4).WriteRaster(10, 10, 5, 5, b"\x00" * 25)
+    rgba_ds = None
+    index_filename = _td_index(
+        tmp_vsimem, [(str(tmp_vsimem / "rgba.tif"), 1, RECT), (rgb, 2, RECT)],
+        md={"BAND_COUNT": "4", "COLOR_INTERPRETATION": "Red,Green,Blue,Alpha"}, nodata=None,
+    )
+    ref_ds = gdal.Open(index_filename)
+    ds = _td_open(index_filename, 2)
+    for b in range(1, 5):
+        assert ds.GetRasterBand(b).ReadRaster() == ref_ds.GetRasterBand(b).ReadRaster(), b
+    data = ds.ReadRaster(0, 0, 20, 20)
+    assert ds.GetRasterBand(4).ReadRaster()[5 * 20 + 5] == 255
+    assert ds.GetRasterBand(1).ReadRaster()[5 * 20 + 5] == 10
+
+
+def test_gti_top_down_duplicate_location(tmp_vsimem):
+
+    bottom, _, top = _td_stack(tmp_vsimem, "nodata")
+    index_filename = _td_index(tmp_vsimem, [(bottom, 1, RECT), (top, 2, RECT), (top, 3, RECT)])
+    ref_ds = gdal.Open(index_filename)
+    ref = ref_ds.GetRasterBand(1).ReadRaster()
+    ds = _td_open(index_filename, 2)
+    assert ds.GetRasterBand(1).ReadRaster() == ref
+    assert _dbg(ds, "TOP_DOWN_LAST_SOURCES_READ") == "2"
+
+
 def test_gti_single_source_alpha_no_dest_nodata(tmp_vsimem):
 
     filename1 = str(tmp_vsimem / "one.tif")

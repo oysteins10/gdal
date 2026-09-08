@@ -90,6 +90,9 @@ constexpr const char *MD_MASK_BAND = "MASK_BAND";
 constexpr const char *MD_RESAMPLING = "RESAMPLING";
 constexpr const char *MD_INTERLEAVE = "INTERLEAVE";
 constexpr const char *MD_TRUST_FOOTPRINT = "TRUST_FOOTPRINT";
+constexpr const char *MD_TOP_DOWN_RENDERING = "TOP_DOWN_RENDERING";
+constexpr const char *MD_MAX_SOURCES_PER_REQUEST = "MAX_SOURCES_PER_REQUEST";
+constexpr const char *MD_TOP_DOWN_PREFETCH = "TOP_DOWN_PREFETCH";
 
 constexpr const char *const apszTIOptions[] = {MD_RESX,
                                                MD_RESY,
@@ -114,7 +117,10 @@ constexpr const char *const apszTIOptions[] = {MD_RESX,
                                                MD_MASK_BAND,
                                                MD_RESAMPLING,
                                                MD_INTERLEAVE,
-                                               MD_TRUST_FOOTPRINT};
+                                               MD_TRUST_FOOTPRINT,
+                                               MD_TOP_DOWN_RENDERING,
+                                               MD_MAX_SOURCES_PER_REQUEST,
+                                               MD_TOP_DOWN_PREFETCH};
 
 constexpr const char *const MD_BAND_OFFSET = "OFFSET";
 constexpr const char *const MD_BAND_SCALE = "SCALE";
@@ -131,6 +137,9 @@ constexpr const char *GTI_XML_SORTFIELD = "SortField";
 constexpr const char *GTI_XML_SORTFIELDASC = "SortFieldAsc";
 constexpr const char *GTI_XML_MASKBAND = "MaskBand";
 constexpr const char *GTI_XML_TRUSTFOOTPRINT = "TrustFootprint";
+constexpr const char *GTI_XML_TOPDOWNRENDERING = "TopDownRendering";
+constexpr const char *GTI_XML_MAXSOURCESPERREQUEST = "MaxSourcesPerRequest";
+constexpr const char *GTI_XML_TOPDOWNPREFETCH = "TopDownPrefetch";
 constexpr const char *GTI_XML_OVERVIEW_ELEMENT = "Overview";
 constexpr const char *GTI_XML_OVERVIEW_DATASET = "Dataset";
 constexpr const char *GTI_XML_OVERVIEW_LAYER = "Layer";
@@ -430,6 +439,25 @@ class GDALTileIndexDataset final : public GDALPamDataset
     //! Number of sources discarded by TRUST_FOOTPRINT in the last CollectSources()
     size_t m_nLastOccludedSources = 0;
 
+    //! Whether sources are rendered from the highest priority down, opened
+    //! lazily, stopping as soon as the request window is filled (TOP_DOWN_RENDERING)
+    bool m_bTopDownRendering = false;
+
+    //! Maximum number of sources composited per request (0 = unlimited)
+    int m_nMaxSourcesPerRequest = 0;
+
+    //! Number of sources read ahead of the compositing cursor (-1 = AUTO)
+    int m_nTopDownPrefetch = -1;
+
+    //! Whether the last CollectSources() prepared a top-down rendering
+    //! (features collected and sorted, tiles not opened).
+    bool m_bLastTopDown = false;
+
+    //! Statistics of the last top-down rendering
+    int m_nLastTopDownRead = 0;
+    int m_nLastTopDownPrefetched = 0;
+    double m_dfLastTopDownFilledRatio = 0;
+
     //! Whether the GTI file is a STAC collection
     bool m_bSTACCollection = false;
 
@@ -479,6 +507,71 @@ class GDALTileIndexDataset final : public GDALPamDataset
     /** Structure used to declare a threaded job to satisfy IRasterIO()
      * on a given source.
      */
+    //! Result of reading the window of one source (TOP_DOWN_RENDERING)
+    struct SourceReadResult
+    {
+        bool bIntersects = false;
+        int nOutXOff = 0;
+        int nOutYOff = 0;
+        int nOutXSize = 0;
+        int nOutYSize = 0;
+        //! nBandCount bands, band-sequential, eBufType, nOutXSize x nOutYSize each
+        std::vector<GByte> abyData{};
+        //! nOutXSize x nOutYSize, non-zero where the source pixel is valid
+        std::vector<GByte> abyValid{};
+    };
+
+    //! Parameters of a pixel request shared by the top-down jobs
+    struct TopDownRequest
+    {
+        int nBandNrMax = 0;
+        double dfXOff = 0;
+        double dfYOff = 0;
+        double dfXSize = 0;
+        double dfYSize = 0;
+        int nBufXSize = 0;
+        int nBufYSize = 0;
+        GDALDataType eBufType = GDT_Unknown;
+        int nBandCount = 0;
+        const int *panBandMap = nullptr;
+        GDALRIOResampleAlg eResampleAlg = GRIORA_NearestNeighbour;
+    };
+
+    //! Per-source slot filled by a top-down job
+    struct TopDownSlot
+    {
+        //! 0 = pending, 1 = done, 2 = failed
+        std::atomic<int> nState{0};
+        SourceReadResult oResult{};
+        CPLErrorAccumulator oErrors{};
+    };
+
+    struct TopDownJob
+    {
+        GDALTileIndexDataset *poDS = nullptr;
+        SourceDesc *psDesc = nullptr;
+        TopDownSlot *psSlot = nullptr;
+        const TopDownRequest *psReq = nullptr;
+        static void Func(void *pData);
+    };
+
+    void RunTopDownJob(TopDownJob &oJob);
+    static void CompositeTopDown(const SourceReadResult &oRes,
+                                 bool bMaskRequest, int nBandCount,
+                                 GDALDataType eBufType, GByte *pabyDest,
+                                 GSpacing nPixelSpace, GSpacing nLineSpace,
+                                 GSpacing nBandSpace, GByte *pabyFilled,
+                                 int nBufXSize, size_t &nFilled);
+    CPLErr ReadSourceWindow(SourceDesc &oSourceDesc,
+                            const TopDownRequest &oReq,
+                            SourceReadResult &oResult) const;
+    CPLErr RenderTopDown(int nBandNrMax, double dfXOff, double dfYOff,
+                         double dfXSize, double dfYSize, int nBufXSize,
+                         int nBufYSize, void *pData, GDALDataType eBufType,
+                         int nBandCount, BANDMAP_TYPE panBandMap,
+                         GSpacing nPixelSpace, GSpacing nLineSpace,
+                         GSpacing nBandSpace, GDALRasterIOExtraArg *psExtraArg);
+
     struct RasterIOJob
     {
         std::atomic<int> *pnCompletedJobs = nullptr;
@@ -1081,6 +1174,12 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
                 pszItem = GTI_XML_MASKBAND;
             else if (EQUAL(pszItem, MD_TRUST_FOOTPRINT))
                 pszItem = GTI_XML_TRUSTFOOTPRINT;
+            else if (EQUAL(pszItem, MD_TOP_DOWN_RENDERING))
+                pszItem = GTI_XML_TOPDOWNRENDERING;
+            else if (EQUAL(pszItem, MD_MAX_SOURCES_PER_REQUEST))
+                pszItem = GTI_XML_MAXSOURCESPERREQUEST;
+            else if (EQUAL(pszItem, MD_TOP_DOWN_PREFETCH))
+                pszItem = GTI_XML_TOPDOWNPREFETCH;
             pszVal = CPLGetXMLValue(psRoot, pszItem, nullptr);
             if (pszVal)
                 return pszVal;
@@ -2456,6 +2555,13 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
 
     if (const char *pszTrustFootprint = GetOption(MD_TRUST_FOOTPRINT))
         m_bTrustFootprint = CPLTestBool(pszTrustFootprint);
+    if (const char *pszTopDown = GetOption(MD_TOP_DOWN_RENDERING))
+        m_bTopDownRendering = CPLTestBool(pszTopDown);
+    if (const char *pszMaxSources = GetOption(MD_MAX_SOURCES_PER_REQUEST))
+        m_nMaxSourcesPerRequest = std::max(0, atoi(pszMaxSources));
+    if (const char *pszPrefetch = GetOption(MD_TOP_DOWN_PREFETCH))
+        m_nTopDownPrefetch =
+            EQUAL(pszPrefetch, "AUTO") ? -1 : std::max(0, atoi(pszPrefetch));
 
     const char *pszMaskBand = GetOption(MD_MASK_BAND);
     if (pszMaskBand)
@@ -2670,6 +2776,18 @@ const char *GDALTileIndexDataset::GetMetadataItem(const char *pszName,
         else if (EQUAL(pszName, "TRUST_FOOTPRINT_LAST_OCCLUDED"))
         {
             return CPLSPrintf("%d", static_cast<int>(m_nLastOccludedSources));
+        }
+        else if (EQUAL(pszName, "TOP_DOWN_LAST_SOURCES_READ"))
+        {
+            return CPLSPrintf("%d", m_nLastTopDownRead);
+        }
+        else if (EQUAL(pszName, "TOP_DOWN_LAST_SOURCES_PREFETCHED"))
+        {
+            return CPLSPrintf("%d", m_nLastTopDownPrefetched);
+        }
+        else if (EQUAL(pszName, "TOP_DOWN_LAST_FILLED_RATIO"))
+        {
+            return CPLSPrintf("%.6f", m_dfLastTopDownFilledRatio);
         }
     }
     return GDALPamDataset::GetMetadataItem(pszName, pszDomain);
@@ -3951,21 +4069,28 @@ bool GDALTileIndexDataset::GetSourceDesc(const std::string &osTileName,
 
             if (bExportSRS)
             {
-                if (m_osWKT.empty())
                 {
-                    char *pszWKT = nullptr;
-                    const char *const apszWKTOptions[] = {"FORMAT=WKT2_2019",
-                                                          nullptr};
-                    m_oSRS.exportToWkt(&pszWKT, apszWKTOptions);
-                    if (pszWKT)
-                        m_osWKT = pszWKT;
-                    CPLFree(pszWKT);
-
+                    // m_osWKT is lazily computed: guard it when several
+                    // threads open sources concurrently.
+                    std::unique_lock<std::mutex> oLock;
+                    if (pMutex)
+                        oLock = std::unique_lock<std::mutex>(*pMutex);
                     if (m_osWKT.empty())
                     {
-                        CPLError(CE_Failure, CPLE_AppDefined,
-                                 "Cannot export VRT SRS to WKT2");
-                        return false;
+                        char *pszWKT = nullptr;
+                        const char *const apszWKTOptions[] = {
+                            "FORMAT=WKT2_2019", nullptr};
+                        m_oSRS.exportToWkt(&pszWKT, apszWKTOptions);
+                        if (pszWKT)
+                            m_osWKT = pszWKT;
+                        CPLFree(pszWKT);
+
+                        if (m_osWKT.empty())
+                        {
+                            CPLError(CE_Failure, CPLE_AppDefined,
+                                     "Cannot export VRT SRS to WKT2");
+                            return false;
+                        }
                     }
                 }
 
@@ -4222,6 +4347,9 @@ bool GDALTileIndexDataset::CollectSources(double dfXOff, double dfYOff,
                                           int nBandCount, const int *panBandMap,
                                           bool bMultiThreadAllowed)
 {
+    // Only IRasterIO() allows multi-threading; the other caller (per-pixel
+    // location info) needs opened sources, so it never uses the lazy path.
+    const bool bCalledFromRasterIO = bMultiThreadAllowed;
     const double dfMinX = m_gt.xorig + dfXOff * m_gt.xscale;
     const double dfMaxX = dfMinX + dfXSize * m_gt.xscale;
     const double dfMaxY = m_gt.yorig + dfYOff * m_gt.yscale;
@@ -4244,6 +4372,7 @@ bool GDALTileIndexDataset::CollectSources(double dfXOff, double dfYOff,
         m_anLastBands = std::vector<int>(panBandMap, panBandMap + nBandCount);
     m_bLastMustUseMultiThreading = false;
     m_nLastOccludedSources = 0;
+    m_bLastTopDown = false;
 
     OGRLayer *poSQLLayer = nullptr;
     if (!m_osSpatialSQL.empty())
@@ -4420,6 +4549,53 @@ bool GDALTileIndexDataset::CollectSources(double dfXOff, double dfYOff,
             m_bLastMustUseMultiThreading = true;
             return true;
         }
+    }
+
+    // TOP_DOWN_RENDERING: sources will be opened lazily, from the highest
+    // priority down, by RenderTopDown(). Only keep (sorted) features here.
+    if (m_bTopDownRendering && bCalledFromRasterIO)
+    {
+        if (!bSorted && m_aoSourceDesc.size() > 1)
+            SortSourceDesc();
+        // Drop features whose envelope does not intersect the window (the
+        // spatial filter may select slightly more than needed), and duplicates
+        // of the same tile (keep the highest priority occurrence).
+        std::set<std::string> oSetTileNames;
+        std::vector<bool> abKeep(m_aoSourceDesc.size(), true);
+        for (size_t i = m_aoSourceDesc.size(); i > 0;)
+        {
+            --i;
+            const auto &poFeature = m_aoSourceDesc[i].poFeature;
+            const auto poGeom = poFeature->GetGeometryRef();
+            if (poGeom && !poGeom->IsEmpty())
+            {
+                OGREnvelope sEnv;
+                poGeom->getEnvelope(&sEnv);
+                if (!(sEnv.MaxX > dfMinX && sEnv.MinX < dfMaxX &&
+                      sEnv.MaxY > dfMinY && sEnv.MinY < dfMaxY))
+                {
+                    abKeep[i] = false;
+                    continue;
+                }
+            }
+            const char *pszTileName =
+                poFeature->GetFieldAsString(m_nLocationFieldIndex);
+            if (!oSetTileNames.insert(pszTileName).second)
+                abKeep[i] = false;
+        }
+        size_t iDst = 0;
+        for (size_t i = 0; i < m_aoSourceDesc.size(); ++i)
+        {
+            if (abKeep[i])
+            {
+                if (iDst != i)
+                    m_aoSourceDesc[iDst] = std::move(m_aoSourceDesc[i]);
+                ++iDst;
+            }
+        }
+        m_aoSourceDesc.resize(iDst);
+        m_bLastTopDown = true;
+        return true;
     }
 
     if (!bSorted && m_aoSourceDesc.size() > 1)
@@ -5301,6 +5477,445 @@ CPLErr GDALTileIndexDataset::RenderSource(
 }
 
 /************************************************************************/
+/*                         ReadSourceWindow()                           */
+/************************************************************************/
+
+/** Read the part of the request window covered by a source into contiguous
+ * band-sequential data and validity buffers (TOP_DOWN_RENDERING).
+ * Validity comes from the per-dataset mask / alpha band of the source when it
+ * has one, else from its band-1 nodata mask, else everything is valid.
+ */
+CPLErr GDALTileIndexDataset::ReadSourceWindow(SourceDesc &oSourceDesc,
+                                              const TopDownRequest &oReq,
+                                              SourceReadResult &oResult) const
+{
+    oResult.bIntersects = false;
+    auto &poTileDS = oSourceDesc.poDS;
+    auto &poSource = oSourceDesc.poSource;
+    if (!poTileDS || !poSource)
+        return CE_Failure;
+
+    GDALRasterIOExtraArg sExtraArg;
+    INIT_RASTERIO_EXTRA_ARG(sExtraArg);
+    sExtraArg.eResampleAlg = oReq.eResampleAlg;
+
+    // The window we will actually request from the source raster band.
+    double dfReqXOff = 0.0;
+    double dfReqYOff = 0.0;
+    double dfReqXSize = 0.0;
+    double dfReqYSize = 0.0;
+    int nReqXOff = 0;
+    int nReqYOff = 0;
+    int nReqXSize = 0;
+    int nReqYSize = 0;
+    // The window we will actually set _within_ the output buffer.
+    int nOutXOff = 0;
+    int nOutYOff = 0;
+    int nOutXSize = 0;
+    int nOutYSize = 0;
+    bool bError = false;
+
+    poSource->SetRasterBand(poTileDS->GetRasterBand(1), false);
+    if (!poSource->GetSrcDstWindow(
+            oReq.dfXOff, oReq.dfYOff, oReq.dfXSize, oReq.dfYSize, oReq.nBufXSize,
+            oReq.nBufYSize, sExtraArg.eResampleAlg, &dfReqXOff, &dfReqYOff,
+            &dfReqXSize, &dfReqYSize, &nReqXOff, &nReqYOff, &nReqXSize,
+            &nReqYSize, &nOutXOff, &nOutYOff, &nOutXSize, &nOutYSize, bError))
+    {
+        return bError ? CE_Failure : CE_None;
+    }
+    sExtraArg.bFloatingPointWindowValidity = TRUE;
+    sExtraArg.dfXOff = dfReqXOff;
+    sExtraArg.dfYOff = dfReqYOff;
+    sExtraArg.dfXSize = dfReqXSize;
+    sExtraArg.dfYSize = dfReqYSize;
+
+    oResult.nOutXOff = nOutXOff;
+    oResult.nOutYOff = nOutYOff;
+    oResult.nOutXSize = nOutXSize;
+    oResult.nOutYSize = nOutYSize;
+    const size_t nPixels = static_cast<size_t>(nOutXSize) * nOutYSize;
+
+    try
+    {
+        oResult.abyValid.assign(nPixels, 255);
+    }
+    catch (const std::bad_alloc &)
+    {
+        CPLError(CE_Failure, CPLE_OutOfMemory,
+                 "Cannot allocate validity buffer");
+        return CE_Failure;
+    }
+    GDALRasterBand *poValidityBand = oSourceDesc.poMaskBand;
+    if (!poValidityBand && oSourceDesc.bHasNoData)
+        poValidityBand = poTileDS->GetRasterBand(1)->GetMaskBand();
+    if (poValidityBand &&
+        poValidityBand->RasterIO(GF_Read, nReqXOff, nReqYOff, nReqXSize,
+                                 nReqYSize, oResult.abyValid.data(), nOutXSize,
+                                 nOutYSize, GDT_UInt8, 0, 0,
+                                 &sExtraArg) != CE_None)
+    {
+        return CE_Failure;
+    }
+    oResult.bIntersects = true;
+
+    // Dataset mask band request: the validity is the data.
+    if (oReq.nBandNrMax == 0)
+        return CE_None;
+
+    const int nBufTypeSize = GDALGetDataTypeSizeBytes(oReq.eBufType);
+    const size_t nBandSize = nPixels * nBufTypeSize;
+    try
+    {
+        oResult.abyData.resize(nBandSize * oReq.nBandCount);
+    }
+    catch (const std::bad_alloc &)
+    {
+        CPLError(CE_Failure, CPLE_OutOfMemory, "Cannot allocate working buffer");
+        return CE_Failure;
+    }
+
+    const int nTileBands = poTileDS->GetRasterCount();
+    std::vector<int> anTileBands;
+    std::vector<int> anSlots;
+    for (int i = 0; i < oReq.nBandCount; ++i)
+    {
+        const int nBandNr =
+            oSourceDesc.bBandMapTakenIntoAccount ? i + 1 : oReq.panBandMap[i];
+        if (nBandNr >= 1 && nBandNr <= nTileBands)
+        {
+            anTileBands.push_back(nBandNr);
+            anSlots.push_back(i);
+        }
+        else if (nBandNr == oReq.nBandNrMax && nBandNr == nTileBands + 1 &&
+                 papoBands[nBandNr - 1]->GetColorInterpretation() ==
+                     GCI_AlphaBand &&
+                 oReq.eBufType == GDT_UInt8)
+        {
+            // Mix of RGB and RGBA sources: synthesize an opaque alpha band
+            // (the validity mask restricts it to the valid pixels).
+            memset(oResult.abyData.data() + i * nBandSize, 255, nBandSize);
+        }
+        else
+        {
+            CPLError(CE_Failure, CPLE_AppDefined, "%s has not enough bands.",
+                     oSourceDesc.osName.c_str());
+            return CE_Failure;
+        }
+    }
+
+    bool bContiguousSlots = true;
+    for (size_t i = 1; i < anSlots.size(); ++i)
+    {
+        if (anSlots[i] != anSlots[i - 1] + 1)
+            bContiguousSlots = false;
+    }
+    if (!anTileBands.empty() && bContiguousSlots)
+    {
+        if (poTileDS->RasterIO(
+                GF_Read, nReqXOff, nReqYOff, nReqXSize, nReqYSize,
+                oResult.abyData.data() + anSlots[0] * nBandSize, nOutXSize,
+                nOutYSize, oReq.eBufType, static_cast<int>(anTileBands.size()),
+                anTileBands.data(), nBufTypeSize,
+                static_cast<GSpacing>(nOutXSize) * nBufTypeSize,
+                static_cast<GSpacing>(nBandSize), &sExtraArg) != CE_None)
+        {
+            return CE_Failure;
+        }
+    }
+    else
+    {
+        for (size_t i = 0; i < anTileBands.size(); ++i)
+        {
+            if (poTileDS->GetRasterBand(anTileBands[i])->RasterIO(
+                    GF_Read, nReqXOff, nReqYOff, nReqXSize, nReqYSize,
+                    oResult.abyData.data() + anSlots[i] * nBandSize, nOutXSize,
+                    nOutYSize, oReq.eBufType, nBufTypeSize,
+                    static_cast<GSpacing>(nOutXSize) * nBufTypeSize,
+                    &sExtraArg) != CE_None)
+            {
+                return CE_Failure;
+            }
+        }
+    }
+    return CE_None;
+}
+
+/************************************************************************/
+/*                          CompositeTopDown()                          */
+/************************************************************************/
+
+/** Write the valid pixels of a source into the output buffer where nothing
+ * has been written yet, and mark them as filled.
+ */
+void GDALTileIndexDataset::CompositeTopDown(
+    const SourceReadResult &oRes, bool bMaskRequest, int nBandCount,
+    GDALDataType eBufType, GByte *pabyDest, GSpacing nPixelSpace,
+    GSpacing nLineSpace, GSpacing nBandSpace, GByte *pabyFilled, int nBufXSize,
+    size_t &nFilled)
+{
+    const int nBufTypeSize = GDALGetDataTypeSizeBytes(eBufType);
+    const size_t nPixels =
+        static_cast<size_t>(oRes.nOutXSize) * oRes.nOutYSize;
+    for (int iY = 0; iY < oRes.nOutYSize; ++iY)
+    {
+        GByte *pabyFilledLine =
+            pabyFilled +
+            static_cast<size_t>(oRes.nOutYOff + iY) * nBufXSize + oRes.nOutXOff;
+        const GByte *pabyValidLine =
+            oRes.abyValid.data() + static_cast<size_t>(iY) * oRes.nOutXSize;
+        GByte *pabyDestLine =
+            pabyDest + static_cast<GPtrDiff_t>((oRes.nOutYOff + iY) * nLineSpace +
+                                               oRes.nOutXOff * nPixelSpace);
+        for (int iX = 0; iX < oRes.nOutXSize; ++iX)
+        {
+            if (pabyValidLine[iX] && !pabyFilledLine[iX])
+            {
+                pabyFilledLine[iX] = 1;
+                ++nFilled;
+                GByte *pabyDst =
+                    pabyDestLine + static_cast<GPtrDiff_t>(iX * nPixelSpace);
+                if (bMaskRequest)
+                {
+                    // Propagate the source mask value (may be intermediate
+                    // with non-nearest resampling), as the default path does.
+                    GDALCopyWords64(&pabyValidLine[iX], GDT_UInt8, 0, pabyDst,
+                                    eBufType, 0, 1);
+                }
+                else
+                {
+                    const size_t nSrcOff =
+                        (static_cast<size_t>(iY) * oRes.nOutXSize + iX) *
+                        nBufTypeSize;
+                    for (int iBand = 0; iBand < nBandCount; ++iBand)
+                    {
+                        memcpy(pabyDst +
+                                   static_cast<GPtrDiff_t>(iBand * nBandSpace),
+                               oRes.abyData.data() +
+                                   iBand * nPixels * nBufTypeSize + nSrcOff,
+                               nBufTypeSize);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/************************************************************************/
+/*                           RunTopDownJob()                            */
+/************************************************************************/
+
+void GDALTileIndexDataset::RunTopDownJob(TopDownJob &oJob)
+{
+    auto oAccumulator = oJob.psSlot->oErrors.InstallForCurrentScope();
+    CPL_IGNORE_RET_VAL(oAccumulator);
+    bool bOK = true;
+    if (!oJob.psDesc->poDS)
+    {
+        const std::string osTileName(GetAbsoluteFileName(
+            oJob.psDesc->poFeature->GetFieldAsString(m_nLocationFieldIndex),
+            GetDescription(), m_bSTACCollection));
+        bOK = GetSourceDesc(osTileName, *oJob.psDesc,
+                            &m_oQueueWorkingStates.oMutex,
+                            oJob.psReq->nBandCount, oJob.psReq->panBandMap);
+    }
+    if (bOK)
+        bOK = ReadSourceWindow(*oJob.psDesc, *oJob.psReq,
+                               oJob.psSlot->oResult) == CE_None;
+    oJob.psSlot->nState.store(bOK ? 1 : 2);
+}
+
+void GDALTileIndexDataset::TopDownJob::Func(void *pData)
+{
+    auto psJob = static_cast<TopDownJob *>(pData);
+    psJob->poDS->RunTopDownJob(*psJob);
+    delete psJob;
+}
+
+/************************************************************************/
+/*                           RenderTopDown()                            */
+/************************************************************************/
+
+/** Composite the sources from the highest priority down, opening and
+ * reading them lazily (ahead of the compositing cursor with a thread pool),
+ * and stop as soon as the request window is entirely filled.
+ */
+CPLErr GDALTileIndexDataset::RenderTopDown(
+    int nBandNrMax, double dfXOff, double dfYOff, double dfXSize,
+    double dfYSize, int nBufXSize, int nBufYSize, void *pData,
+    GDALDataType eBufType, int nBandCount, BANDMAP_TYPE panBandMap,
+    GSpacing nPixelSpace, GSpacing nLineSpace, GSpacing nBandSpace,
+    GDALRasterIOExtraArg *psExtraArg)
+{
+    m_nLastTopDownRead = 0;
+    m_nLastTopDownPrefetched = 0;
+    m_dfLastTopDownFilledRatio = 0;
+    const int nSources = static_cast<int>(m_aoSourceDesc.size());
+    if (nSources == 0)
+    {
+        if (psExtraArg->pfnProgress)
+            psExtraArg->pfnProgress(1.0, "", psExtraArg->pProgressData);
+        return CE_None;
+    }
+
+    TopDownRequest oReq;
+    oReq.nBandNrMax = nBandNrMax;
+    oReq.dfXOff = dfXOff;
+    oReq.dfYOff = dfYOff;
+    oReq.dfXSize = dfXSize;
+    oReq.dfYSize = dfYSize;
+    oReq.nBufXSize = nBufXSize;
+    oReq.nBufYSize = nBufYSize;
+    oReq.eBufType = eBufType;
+    oReq.nBandCount = nBandCount;
+    oReq.panBandMap = panBandMap;
+    oReq.eResampleAlg = psExtraArg->eResampleAlg != GRIORA_NearestNeighbour
+                            ? psExtraArg->eResampleAlg
+                            : m_eResampling;
+    const bool bMaskRequest = nBandNrMax == 0;
+
+    const size_t nTotal = static_cast<size_t>(nBufXSize) * nBufYSize;
+    std::vector<GByte> abyFilled;
+    std::vector<std::unique_ptr<TopDownSlot>> aoSlots;
+    try
+    {
+        abyFilled.resize(nTotal);
+        aoSlots.reserve(nSources);
+        for (int i = 0; i < nSources; ++i)
+            aoSlots.push_back(std::make_unique<TopDownSlot>());
+    }
+    catch (const std::bad_alloc &)
+    {
+        CPLError(CE_Failure, CPLE_OutOfMemory,
+                 "Cannot allocate working buffers");
+        return CE_Failure;
+    }
+    size_t nFilled = 0;
+
+    // Prefetch depth: number of sources read ahead of the compositing cursor.
+    if (m_nNumThreads < 0)
+        m_nNumThreads = GetNumThreads();
+    const int nThreads = std::max(1, m_nNumThreads);
+    int nDepth = m_nTopDownPrefetch < 0 ? 1 : m_nTopDownPrefetch;
+    if (nThreads <= 1 || nSources == 1)
+        nDepth = 0;
+    std::unique_ptr<CPLJobQueue> poQueue;
+    if (nDepth > 0)
+    {
+        CPLWorkerThreadPool *poPool =
+            GDALGetGlobalThreadPool(std::min(nThreads, nSources));
+        if (poPool)
+            poQueue = poPool->CreateJobQueue();
+        if (!poQueue)
+            nDepth = 0;
+    }
+    CPLDebugOnly("GTI",
+                 "RenderTopDown(): %d candidate source(s), prefetch depth %d",
+                 nSources, nDepth);
+
+    int idxNext = nSources - 1;  // next source to submit (highest priority first)
+    int nInFlight = 0;
+    const auto Submit = [&]()
+    {
+        while (idxNext >= 0 && nInFlight < 1 + nDepth)
+        {
+            auto psJob = new TopDownJob();
+            psJob->poDS = this;
+            psJob->psDesc = &m_aoSourceDesc[idxNext];
+            psJob->psSlot = aoSlots[idxNext].get();
+            psJob->psReq = &oReq;
+            if (!poQueue->SubmitJob(TopDownJob::Func, psJob))
+            {
+                delete psJob;
+                return false;
+            }
+            ++nInFlight;
+            ++m_nLastTopDownPrefetched;
+            --idxNext;
+        }
+        return true;
+    };
+
+    CPLErr eErr = CE_None;
+    for (int idx = nSources - 1; idx >= 0 && eErr == CE_None; --idx)
+    {
+        TopDownSlot &oSlot = *aoSlots[idx];
+        if (nDepth > 0)
+        {
+            if (!Submit())
+            {
+                eErr = CE_Failure;
+                break;
+            }
+            // The job for this slot has been submitted: wait for it.
+            while (oSlot.nState.load() == 0)
+                poQueue->WaitEvent();
+            --nInFlight;
+        }
+        else
+        {
+            TopDownJob oJob;
+            oJob.poDS = this;
+            oJob.psDesc = &m_aoSourceDesc[idx];
+            oJob.psSlot = &oSlot;
+            oJob.psReq = &oReq;
+            RunTopDownJob(oJob);
+            ++m_nLastTopDownPrefetched;
+        }
+
+        if (oSlot.nState.load() == 2)
+        {
+            // A source that is actually needed could not be read
+            oSlot.oErrors.ReplayErrors();
+            eErr = CE_Failure;
+            break;
+        }
+
+        const bool bIntersects = oSlot.oResult.bIntersects;
+        if (bIntersects)
+        {
+            CompositeTopDown(oSlot.oResult, bMaskRequest, nBandCount, eBufType,
+                             static_cast<GByte *>(pData), nPixelSpace,
+                             nLineSpace, nBandSpace, abyFilled.data(),
+                             nBufXSize, nFilled);
+            ++m_nLastTopDownRead;
+        }
+        // Release the buffers of this source early
+        oSlot.oResult = SourceReadResult();
+
+        if (psExtraArg->pfnProgress)
+        {
+            psExtraArg->pfnProgress(
+                std::min(0.99, static_cast<double>(nFilled) /
+                                   static_cast<double>(
+                                       std::max<size_t>(1, nTotal))),
+                "", psExtraArg->pProgressData);
+        }
+
+        if (nFilled == nTotal)
+            break;
+        if (m_nMaxSourcesPerRequest > 0 &&
+            m_nLastTopDownRead >= m_nMaxSourcesPerRequest)
+            break;
+        // AUTO mode: this source left pixels unfilled, so the stack is patchy;
+        // read further ahead (up to the number of threads).
+        if (bIntersects && m_nTopDownPrefetch < 0 && nDepth > 0)
+            nDepth = std::min(nDepth * 2, nThreads);
+    }
+
+    // No new submission after the stop; drain what is in flight and discard.
+    if (poQueue)
+        poQueue->WaitCompletion();
+
+    m_dfLastTopDownFilledRatio =
+        nTotal ? static_cast<double>(nFilled) / static_cast<double>(nTotal)
+               : 1.0;
+    if (eErr == CE_None && psExtraArg->pfnProgress)
+        psExtraArg->pfnProgress(1.0, "", psExtraArg->pProgressData);
+    return eErr;
+}
+
+/************************************************************************/
 /*                             IRasterIO()                              */
 /************************************************************************/
 
@@ -5365,6 +5980,16 @@ CPLErr GDALTileIndexDataset::IRasterIO(
     {
         const int nBandNr = panBandMap[i];
         nBandNrMax = std::max(nBandNrMax, nBandNr);
+    }
+
+    if (m_bLastTopDown)
+    {
+        InitBuffer(pData, nBufXSize, nBufYSize, eBufType, nBandCount,
+                   panBandMap, nPixelSpace, nLineSpace, nBandSpace);
+        return RenderTopDown(nBandNrMax, dfXOff, dfYOff, dfXSize, dfYSize,
+                             nBufXSize, nBufYSize, pData, eBufType, nBandCount,
+                             panBandMap, nPixelSpace, nLineSpace, nBandSpace,
+                             psExtraArg);
     }
 
     const bool bNeedInitBuffer =
