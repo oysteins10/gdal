@@ -388,6 +388,12 @@ class GDALTileIndexDataset final : public GDALPamDataset
         //! Work buffer containing the value of the mask band for the current pixel query.
         mutable std::vector<GByte> abyMask{};
 
+        //! Dimensions of the output window abyMask has been fetched for.
+        //! (CollectSources() reuses the source list when the georeferenced
+        //! window is unchanged, but the output buffer size may differ.)
+        mutable int nMaskXSize = 0;
+        mutable int nMaskYSize = 0;
+
         //! Whether the source covers the whole area of interest of the current pixel query.
         bool bCoversWholeAOI = false;
 
@@ -4988,8 +4994,10 @@ CPLErr GDALTileIndexDataset::RenderSource(
             sExtraArg.dfXSize = dfReqXSize;
             sExtraArg.dfYSize = dfReqYSize;
 
-            if (iMaskBandIdx < 0 && oSourceDesc.abyMask.empty() &&
-                oSourceDesc.poMaskBand)
+            if (iMaskBandIdx < 0 && oSourceDesc.poMaskBand &&
+                (oSourceDesc.abyMask.empty() ||
+                 oSourceDesc.nMaskXSize != nOutXSize ||
+                 oSourceDesc.nMaskYSize != nOutYSize))
             {
                 // Fetch the mask band
                 try
@@ -5010,8 +5018,12 @@ CPLErr GDALTileIndexDataset::RenderSource(
                         GDT_UInt8, 0, 0, &sExtraArg) != CE_None)
                 {
                     oSourceDesc.abyMask.clear();
+                    oSourceDesc.nMaskXSize = 0;
+                    oSourceDesc.nMaskYSize = 0;
                     return CE_Failure;
                 }
+                oSourceDesc.nMaskXSize = nOutXSize;
+                oSourceDesc.nMaskYSize = nOutYSize;
             }
 
             // Allocate a temporary contiguous buffer to receive pixel data

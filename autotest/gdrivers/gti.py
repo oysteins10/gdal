@@ -1790,10 +1790,12 @@ def test_gti_on_the_fly_warping_per_dataset_mask(tmp_vsimem):
     # Index in another SRS: the tile will be warped on the fly
     warped_ds = gdal.Warp("", tile_ds, format="VRT", dstSRS="EPSG:4267")
     warped_gt = warped_ds.GetGeoTransform()
-    minx = warped_gt[0]
-    maxx = minx + warped_ds.RasterXSize * warped_gt[1]
-    maxy = warped_gt[3]
-    miny = maxy + warped_ds.RasterYSize * warped_gt[5]
+    # Footprint slightly larger than the warped tile, so that the source does
+    # not cover the whole mosaic and the mask compositing path is exercised.
+    minx = warped_gt[0] - 2 * warped_gt[1]
+    maxx = warped_gt[0] + (warped_ds.RasterXSize + 2) * warped_gt[1]
+    maxy = warped_gt[3] - 2 * warped_gt[5]
+    miny = warped_gt[3] + (warped_ds.RasterYSize + 2) * warped_gt[5]
 
     index_filename = str(tmp_vsimem / "index.gti.gpkg")
     index_ds = ogr.GetDriverByName("GPKG").CreateDataSource(index_filename)
@@ -1823,6 +1825,19 @@ def test_gti_on_the_fly_warping_per_dataset_mask(tmp_vsimem):
     for m, d in zip(mask, data):
         assert (m != 0) == (d != 0)
     assert set(data) == {0, 100}
+
+    # Same georeferenced window, different buffer sizes: the source list is
+    # reused, but the per-source mask work buffer must not be.
+    xsize, ysize = vrt_ds.RasterXSize, vrt_ds.RasterYSize
+    for buf_xsize, buf_ysize in ((xsize // 2, ysize // 2), (xsize, ysize)):
+        got = vrt_ds.GetRasterBand(1).ReadRaster(
+            0, 0, xsize, ysize, buf_xsize=buf_xsize, buf_ysize=buf_ysize
+        )
+        ref_ds = gdal.Open(index_filename)
+        ref = ref_ds.GetRasterBand(1).ReadRaster(
+            0, 0, xsize, ysize, buf_xsize=buf_xsize, buf_ysize=buf_ysize
+        )
+        assert got == ref, (buf_xsize, buf_ysize)
 
 
 def test_gti_single_source_alpha_no_dest_nodata(tmp_vsimem):
