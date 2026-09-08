@@ -177,10 +177,19 @@ GDALOverviewDataset::GDALOverviewDataset(GDALDataset *poMainDSIn,
     nRasterXSize = poFirstBand->GetXSize();
     nRasterYSize = poFirstBand->GetYSize();
     poOvrDS = poFirstBand->GetDataset();
-    if (nOvrLevel != -1 && poOvrDS != nullptr && poOvrDS == poMainDS)
+    if (nOvrLevel != -1 && poOvrDS != nullptr &&
+        (poOvrDS == poMainDS || poOvrDS->GetRasterXSize() != nRasterXSize ||
+         poOvrDS->GetRasterYSize() != nRasterYSize))
     {
-        CPLDebug("GDAL", "Dataset of overview is the same as the main band. "
-                         "This is not expected");
+        // The overview band does not come from a dataset of its own size:
+        // typically a proxy (GDALProxyPoolDataset) overview band reporting
+        // the full-resolution dataset, possibly through a nested
+        // GDALOverviewDataset (poMainDS is then not that dataset). Issuing
+        // requests to it would read full resolution pixels at overview
+        // coordinates.
+        CPLDebug("GDAL", "Dataset of overview is the same as the main band, "
+                         "or has not the overview dimensions. Not using it "
+                         "for RasterIO()");
         poOvrDS = nullptr;
     }
     nBands = poMainDS->GetRasterCount();

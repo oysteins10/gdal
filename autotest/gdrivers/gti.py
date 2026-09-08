@@ -2573,6 +2573,59 @@ def test_gti_implicit_overview_shares_index_dataset(tmp_vsimem):
     ds = None
 
 
+def test_gti_on_the_fly_warping_downsampled_read(tmp_vsimem):
+    """Reprojected tile whose resolution is finer than half the mosaic's: gdalwarp
+    picks a source overview, and downsampled reads of the mosaic go through the
+    warped VRT's implicit overviews. Those must read the right source overview
+    (a GDALOverviewDataset over a proxy source used to send overview-coordinate
+    reads to the full resolution dataset: data compressed towards the origin)."""
+
+    np = pytest.importorskip("numpy")
+
+    n, res = 1000, 0.0125
+    tile_filename = str(tmp_vsimem / "tile.tif")
+    # 3 bands: the warped VRT is then read through the dataset-level RasterIO
+    # (all bands at once), the path that used the implicit overviews wrongly
+    tile_ds = gdal.GetDriverByName("GTiff").Create(tile_filename, n, n, 3, gdal.GDT_Byte,
+                                                   ["TILED=YES"])
+    tile_ds.SetGeoTransform([500000, res, 0, 7570000, 0, -res])
+    tile_ds.SetProjection("EPSG:32633")
+    # left-to-right gradient: a misplaced read shows up as a wrong mean
+    for i in range(3):
+        tile_ds.GetRasterBand(i + 1).WriteArray(
+            np.tile(np.linspace(20, 235, n).astype(np.uint8), (n, 1)))
+    tile_ds.BuildOverviews("AVERAGE", [2, 4, 8])
+    tile_ds = None
+
+    warped_ds = gdal.Warp("", tile_filename, format="VRT", dstSRS="EPSG:25833")
+    gt = warped_ds.GetGeoTransform()
+    minx, maxy = gt[0], gt[3]
+    maxx, miny = gt[0] + gt[1] * warped_ds.RasterXSize, gt[3] + gt[5] * warped_ds.RasterYSize
+    index_filename = str(tmp_vsimem / "index.gti.gpkg")
+    index_ds = ogr.GetDriverByName("GPKG").CreateDataSource(index_filename)
+    lyr = index_ds.CreateLayer("index", srs=warped_ds.GetSpatialRef())
+    lyr.CreateField(ogr.FieldDefn("location"))
+    f = ogr.Feature(lyr.GetLayerDefn())
+    f["location"] = tile_filename
+    f.SetGeometry(ogr.CreateGeometryFromWkt(
+        f"POLYGON(({minx} {miny},{minx} {maxy},{maxx} {maxy},{maxx} {miny},{minx} {miny}))"))
+    lyr.CreateFeature(f)
+    lyr.SetMetadataItem("RESX", "0.036")   # 2.88 x the tile resolution
+    lyr.SetMetadataItem("RESY", "0.036")
+    del index_ds
+
+    ds = gdal.Open(index_filename)
+    band = ds.GetRasterBand(1)
+    w = int(5 / 0.036)      # 5 m window at the mosaic centre (tile centre: gradient ~127)
+    x0, y0 = ds.RasterXSize // 2 - w // 2, ds.RasterYSize // 2 - w // 2
+    full = np.frombuffer(band.ReadRaster(x0, y0, w, w), dtype=np.uint8)
+    assert abs(full.mean() - 127) < 8
+    for k in (2, 4):
+        down = np.frombuffer(band.ReadRaster(x0, y0, w, w, w // k, w // k), dtype=np.uint8)
+        assert abs(down.mean() - full.mean()) < 5, (k, down.mean(), full.mean())
+    ds = None
+
+
 def test_gti_single_source_alpha_no_dest_nodata(tmp_vsimem):
 
     filename1 = str(tmp_vsimem / "one.tif")
