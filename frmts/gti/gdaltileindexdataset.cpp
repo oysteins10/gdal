@@ -4669,6 +4669,7 @@ bool GDALTileIndexDataset::CollectSources(double dfXOff, double dfYOff,
                     // using "gdal raster index", which uses a simple 4-corner
                     // reprojection logic. So also test using that method,
                     // before emitting any warning.
+                    bool bEmitWarning = true;
                     if (oSourceDesc.poUnreprojectedDS != oSourceDesc.poDS.get())
                     {
                         const int nXSize =
@@ -4720,13 +4721,17 @@ bool GDALTileIndexDataset::CollectSources(double dfXOff, double dfYOff,
                                 if (sGeomTileExtent.Contains(
                                         sActualTileExtent2))
                                 {
-                                    continue;
+                                    // Consistent with the 4-corner method:
+                                    // no warning, but the source must of
+                                    // course still be rendered.
+                                    bEmitWarning = false;
                                 }
                             }
                         }
                     }
 
-                    CPLError(CE_Warning, CPLE_AppDefined,
+                    if (bEmitWarning)
+                        CPLError(CE_Warning, CPLE_AppDefined,
                              "Tile index is out of sync with actual extent "
                              "of %s. Bounding box from tile index is "
                              "(%.15g, %.15g, %.15g, %.15g) does not fully "

@@ -2397,6 +2397,42 @@ def test_gti_top_down_duplicate_location(tmp_vsimem):
     assert _dbg(ds, "TOP_DOWN_LAST_SOURCES_READ") == "2"
 
 
+def test_gti_on_the_fly_warping_four_corner_footprint(tmp_vsimem):
+    """A tile in another SRS whose index geometry is the reprojection of its 4
+    corners (what indexes built before GDAL 3.12.3, or from a database with
+    ST_Transform(extent), contain) must be rendered, not silently dropped."""
+
+    src_ds = gdal.Open(os.path.join(os.getcwd(), "data", "byte.tif"))
+    gt = src_ds.GetGeoTransform()
+    src_srs = src_ds.GetSpatialRef()
+    dst_srs = osr.SpatialReference()
+    dst_srs.ImportFromEPSG(4267)
+    dst_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    ring = ogr.Geometry(ogr.wkbLinearRing)
+    for px, py in ((0, 0), (0, 20), (20, 20), (20, 0), (0, 0)):
+        ring.AddPoint_2D(gt[0] + px * gt[1], gt[3] + py * gt[5])
+    footprint = ogr.Geometry(ogr.wkbPolygon)
+    footprint.AddGeometry(ring)
+    footprint.AssignSpatialReference(src_srs)
+    footprint.TransformTo(dst_srs)
+
+    index_filename = str(tmp_vsimem / "index.gti.gpkg")
+    index_ds = ogr.GetDriverByName("GPKG").CreateDataSource(index_filename)
+    lyr = index_ds.CreateLayer("index", srs=dst_srs)
+    lyr.CreateField(ogr.FieldDefn("location"))
+    f = ogr.Feature(lyr.GetLayerDefn())
+    f["location"] = src_ds.GetDescription()
+    f.SetGeometry(footprint)
+    lyr.CreateFeature(f)
+    del index_ds
+
+    vrt_ds = gdal.Open(index_filename)
+    with gdal.quiet_errors():
+        data = vrt_ds.GetRasterBand(1).ReadRaster()
+    assert vrt_ds.GetMetadataItem("NUMBER_OF_CONTRIBUTING_SOURCES", "__DEBUG__") == "1"
+    assert max(data) > 0
+
+
 def test_gti_single_source_alpha_no_dest_nodata(tmp_vsimem):
 
     filename1 = str(tmp_vsimem / "one.tif")
