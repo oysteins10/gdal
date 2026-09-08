@@ -2500,6 +2500,79 @@ def test_gti_filter_open_option_with_factor_overview(tmp_vsimem):
     assert ovr.ReadRaster() == b"\x02" * 400
 
 
+def test_gti_implicit_overview_shares_index_dataset(tmp_vsimem):
+    """<Overview><Factor> levels without <Dataset> are this very index opened at
+    a coarser resolution: they must reuse the parent's opened index dataset and
+    extent (one connection for a database-backed index) and still read right."""
+
+    tiles = []
+    for i, val in enumerate((1, 2)):
+        fn = str(tmp_vsimem / f"t{i}.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(fn, 40, 40)
+        ds.SetGeoTransform([2 + 40 * i, 1, 0, 49, 0, -1])
+        ds.GetRasterBand(1).Fill(val)
+        ds = None
+        tiles.append(fn)
+    index_filename = str(tmp_vsimem / "index.gti.gpkg")
+    index_ds = ogr.GetDriverByName("GPKG").CreateDataSource(index_filename)
+    for lyr_name, sel in (("tiles", (0, 1)), ("second_only", (1,))):
+        lyr = index_ds.CreateLayer(lyr_name)
+        lyr.CreateField(ogr.FieldDefn("location"))
+        for i in sel:
+            f = ogr.Feature(lyr.GetLayerDefn())
+            f["location"] = tiles[i]
+            x0 = 2 + 40 * i
+            f.SetGeometry(ogr.CreateGeometryFromWkt(
+                f"POLYGON(({x0} 9,{x0} 49,{x0 + 40} 49,{x0 + 40} 9,{x0} 9))"))
+            lyr.CreateFeature(f)
+    del index_ds
+    other_filename = str(tmp_vsimem / "other.gti")
+    gdal.FileFromMemBuffer(
+        other_filename,
+        f"""<GDALTileIndexDataset>
+    <IndexDataset>{index_filename}</IndexDataset><IndexLayer>tiles</IndexLayer>
+    <BandCount>1</BandCount><DataType>Byte</DataType><ResX>8</ResX><ResY>8</ResY>
+</GDALTileIndexDataset>""",
+    )
+    xml_filename = str(tmp_vsimem / "index.gti")
+    gdal.FileFromMemBuffer(
+        xml_filename,
+        f"""<GDALTileIndexDataset>
+    <IndexDataset>{index_filename}</IndexDataset><IndexLayer>tiles</IndexLayer>
+    <BandCount>1</BandCount><DataType>Byte</DataType><ResX>1</ResX><ResY>1</ResY>
+    <Overview><Factor>2</Factor></Overview>
+    <Overview><Factor>4</Factor><Layer>second_only</Layer></Overview>
+    <Overview><Dataset>{other_filename}</Dataset></Overview>
+</GDALTileIndexDataset>""",
+    )
+
+    ds = gdal.Open(xml_filename)
+    assert (ds.RasterXSize, ds.RasterYSize) == (80, 40)
+    band = ds.GetRasterBand(1)
+    assert band.GetOverviewCount() == 3
+    ovr0, ovr1, ovr2 = (band.GetOverview(i) for i in range(3))
+
+    # same index, same layer: shared, same extent
+    assert ovr0.GetDataset().GetMetadataItem("INDEX_DATASET_SHARED_WITH_PARENT", "__DEBUG__") == "YES"
+    assert (ovr0.XSize, ovr0.YSize) == (40, 20)
+    assert ovr0.GetDataset().GetGeoTransform() == (2, 2, 0, 49, 0, -2)
+    assert ovr0.ReadRaster(0, 0, 40, 20) == (b"\x01" * 20 + b"\x02" * 20) * 20
+    # same index, other layer: shared dataset, own layer (here: right tile only)
+    assert ovr1.GetDataset().GetMetadataItem("INDEX_DATASET_SHARED_WITH_PARENT", "__DEBUG__") == "YES"
+    assert ovr1.GetDataset().GetGeoTransform() == (2, 4, 0, 49, 0, -4)
+    assert set(ovr1.ReadRaster(0, 0, 20, 10)) == {0, 2}
+    # another dataset: not shared
+    assert ovr2.GetDataset().GetMetadataItem("INDEX_DATASET_SHARED_WITH_PARENT", "__DEBUG__") == "NO"
+    assert (ovr2.XSize, ovr2.YSize) == (10, 5)
+
+    # downsampled reads through the parent go through the shared level
+    assert band.ReadRaster(0, 0, 80, 40, 40, 20) == ovr0.ReadRaster(0, 0, 40, 20)
+    assert band.ReadRaster(0, 0, 80, 40, 10, 5) == ovr2.ReadRaster(0, 0, 10, 5)
+    # parent still reads fine after the levels used the shared layer
+    assert band.ReadRaster(0, 0, 80, 40) == (b"\x01" * 40 + b"\x02" * 40) * 40
+    ds = None
+
+
 def test_gti_single_source_alpha_no_dest_nodata(tmp_vsimem):
 
     filename1 = str(tmp_vsimem / "one.tif")

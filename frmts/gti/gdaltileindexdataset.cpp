@@ -262,8 +262,9 @@ class GDALTileIndexDataset final : public GDALPamDataset
     //! GDALProxyPoolDataset to ensure that sources are unique for a given owner
     const std::string m_osUniqueHandle;
 
-    //! Vector dataset with the sources
-    std::unique_ptr<GDALDataset> m_poVectorDS{};
+    //! Vector dataset with the sources. Shared with the implicit overview
+    //! levels (<Overview><Factor> without <Dataset>) of this dataset.
+    std::shared_ptr<GDALDataset> m_poVectorDS{};
 
     //! Generic SQL request to return features. May be empty.
     std::string m_osSQL{};
@@ -277,6 +278,10 @@ class GDALTileIndexDataset final : public GDALPamDataset
     //! Non-null when m_poLayer was created with ExecuteSQL() and must be freed
     //! with m_poVectorDS->ReleaseResultSet()
     OGRLayer *m_poLayerToRelease = nullptr;
+
+    //! Whether m_poVectorDS (and m_poLayer) come from the parent dataset
+    //! this one is an implicit overview level of.
+    bool m_bVectorDSSharedWithParent = false;
 
     //! When the SRS of m_poLayer is not the one we expose
     std::unique_ptr<OGRWarpedLayer> m_poWarpedLayerKeeper{};
@@ -852,8 +857,29 @@ GTIDoPaletteExpansionIfNeeded(std::shared_ptr<GDALDataset> &poTileDS,
 /*                                Open()                                */
 /************************************************************************/
 
+/************************************************************************/
+/*                    g_poParentForImplicitOverview                     */
+/************************************************************************/
+
+// Set by LoadOverviews() around the opening of an implicit overview level
+// (<Overview><Factor> without <Dataset>): the level is this very tile index
+// opened again at a coarser resolution, so it reuses the parent's already
+// opened index dataset and layer instead of opening them a second time. For
+// a database-backed index (PostGIS, ...) each open is a connection and an
+// extent query, i.e. one per level otherwise. The parent and its levels are
+// always used from the same thread and never iterate the layer at the same
+// time (a level is only read from within the parent's RasterIO).
+static thread_local GDALTileIndexDataset *g_poParentForImplicitOverview =
+    nullptr;
+
 bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
 {
+    // Consume it right away: opening a level may open other datasets
+    // (e.g. a tile inspected for its band structure) that must not see it.
+    GDALTileIndexDataset *const poParentForImplicitOverview =
+        g_poParentForImplicitOverview;
+    g_poParentForImplicitOverview = nullptr;
+
     eAccess = poOpenInfo->eAccess;
 
     CPLXMLNode *psRoot = nullptr;
@@ -947,8 +973,16 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
         }
     }
 
-    if (ENDS_WITH_CI(osIndexDataset.c_str(), ".gti.gpkg") &&
-        poOpenInfo->nHeaderBytes >= 100 &&
+    if (poParentForImplicitOverview && poParentForImplicitOverview->m_poVectorDS &&
+        !poParentForImplicitOverview->m_poLayerToRelease &&
+        strcmp(poParentForImplicitOverview->GetDescription(),
+               poOpenInfo->pszFilename) == 0)
+    {
+        m_poVectorDS = poParentForImplicitOverview->m_poVectorDS;
+        m_bVectorDSSharedWithParent = true;
+    }
+    else if (ENDS_WITH_CI(osIndexDataset.c_str(), ".gti.gpkg") &&
+             poOpenInfo->nHeaderBytes >= 100 &&
         STARTS_WITH(reinterpret_cast<const char *>(poOpenInfo->pabyHeader),
                     "SQLite format 3"))
     {
@@ -1187,6 +1221,16 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
 
         return m_poLayer->GetMetadataItem(pszItem);
     };
+
+    if (m_bVectorDSSharedWithParent)
+    {
+        // The layer object is the parent's: drop the state it may have
+        // left (spatial filter, cursor position) before we inspect features
+        // or query the extent. The parent re-applies its own spatial filter
+        // and resets reading before each of its own iterations.
+        m_poLayer->SetSpatialFilter(nullptr);
+        m_poLayer->ResetReading();
+    }
 
     const char *pszFilter = GetOption("Filter");
     if (pszFilter)
@@ -2789,6 +2833,10 @@ const char *GDALTileIndexDataset::GetMetadataItem(const char *pszName,
         {
             return CPLSPrintf("%.6f", m_dfLastTopDownFilledRatio);
         }
+        else if (EQUAL(pszName, "INDEX_DATASET_SHARED_WITH_PARENT"))
+        {
+            return m_bVectorDSSharedWithParent ? "YES" : "NO";
+        }
     }
     return GDALPamDataset::GetMetadataItem(pszName, pszDomain);
 }
@@ -3177,12 +3225,47 @@ void GDALTileIndexDataset::LoadOverviews()
                 }
             }
 
+            if (osResolvedDSName.empty())
+            {
+                // Implicit level of this very index: hand over the opened
+                // index dataset (see g_poParentForImplicitOverview) and our
+                // extent, so that the level neither reconnects to the index
+                // nor queries the layer extent again. Not when the layer
+                // comes from ExecuteSQL(): a second result set on the same
+                // connection is not safe with every driver.
+                if (m_poVectorDS && !m_poLayerToRelease &&
+                    !aosNewOpenOptions.FetchNameValue("SQL"))
+                {
+                    g_poParentForImplicitOverview = this;
+                }
+                if (m_gt.xrot == 0 && m_gt.yrot == 0 &&
+                    !aosNewOpenOptions.FetchNameValue(MD_MINX) &&
+                    !aosNewOpenOptions.FetchNameValue(MD_MINY) &&
+                    !aosNewOpenOptions.FetchNameValue(MD_MAXX) &&
+                    !aosNewOpenOptions.FetchNameValue(MD_MAXY))
+                {
+                    aosNewOpenOptions.SetNameValue(
+                        MD_MINX, CPLSPrintf("%.17g", m_gt.xorig));
+                    aosNewOpenOptions.SetNameValue(
+                        MD_MAXX, CPLSPrintf("%.17g", m_gt.xorig +
+                                                    m_gt.xscale *
+                                                        nRasterXSize));
+                    aosNewOpenOptions.SetNameValue(
+                        MD_MAXY, CPLSPrintf("%.17g", m_gt.yorig));
+                    aosNewOpenOptions.SetNameValue(
+                        MD_MINY, CPLSPrintf("%.17g", m_gt.yorig +
+                                                    m_gt.yscale *
+                                                        nRasterYSize));
+                }
+            }
             std::unique_ptr<GDALDataset, GDALDatasetUniquePtrReleaser> poOvrDS(
                 GDALDataset::Open(!osResolvedDSName.empty()
                                       ? osResolvedDSName.c_str()
                                       : GetDescription(),
                                   GDAL_OF_RASTER | GDAL_OF_VERBOSE_ERROR,
                                   nullptr, aosNewOpenOptions.List(), nullptr));
+            // Not consumed if the open failed before reaching our Open()
+            g_poParentForImplicitOverview = nullptr;
 
             // Make it possible to use the Factor option on a GeoTIFF for
             // example and translate it to an overview level.
