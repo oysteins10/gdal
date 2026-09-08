@@ -214,6 +214,16 @@ PostGIS, ...), the following layer metadata items may be set:
 * ``MASK_BAND=YES|NO``: whether a dataset-level mask band should be exposed.
   Defaults to NO.
 
+* ``TRUST_FOOTPRINT=YES|NO``: whether the geometry of the tile index features
+  is an authoritative valid-data footprint of the tiles. When set to YES, for
+  each pixel request, tiles whose footprint is hidden under the footprint of a
+  higher-priority tile (as defined by SORT_FIELD) that fully contains the
+  request window are neither opened nor rendered. This considerably speeds up
+  mosaics of many overlapping tiles (e.g. time series), at the cost that nodata
+  or masked pixels of the top tile are no longer filled from the tiles beneath
+  it. Rectangular footprints are tested through their envelope; other polygons
+  require GEOS. Defaults to NO.
+
 * ``RESAMPLING=<val>``: Resampling method to use for on-the-fly reprojection,
   or rendering of tiles whose origin coordinates are not at an offset multiple
   of the resolution of the mosaic compared to the origin of the mosaic. In that
@@ -320,6 +330,7 @@ mentioned in the previous section.
         <Filter>pub_date >= '2023/12/01'</Filter>      <!-- optional -->
         <SortField>pub_date</SortField>                <!-- optional -->
         <SortFieldAsc>true</SortFieldAsc>              <!-- optional -->
+        <TrustFootprint>false</TrustFootprint>         <!-- optional -->
         <SRS>EPSG:4326</SRS>                           <!-- optional -->
         <ResX>60</ResX>                                <!-- optional, but recommended -->
         <ResY>60</ResY>                                <!-- optional, but recommended -->
@@ -512,6 +523,15 @@ also defined as layer metadata items or in the .gti XML file
       :default: YES
 
       Whether the values in SORT_FIELD should be sorted in ascending or descending order
+
+-  .. oo:: TRUST_FOOTPRINT
+      :choices: YES, NO
+      :default: NO
+
+      Whether the tile index geometries are authoritative valid-data footprints:
+      tiles hidden under the footprint of a higher-priority tile that fully contains
+      the request window are neither opened nor rendered.
+      Same role as the TRUST_FOOTPRINT layer metadata item.
 
 -  .. oo:: FILTER
       :choices: <string>

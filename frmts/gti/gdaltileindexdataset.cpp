@@ -89,6 +89,7 @@ constexpr const char *MD_BLOCK_Y_SIZE = "BLOCKYSIZE";
 constexpr const char *MD_MASK_BAND = "MASK_BAND";
 constexpr const char *MD_RESAMPLING = "RESAMPLING";
 constexpr const char *MD_INTERLEAVE = "INTERLEAVE";
+constexpr const char *MD_TRUST_FOOTPRINT = "TRUST_FOOTPRINT";
 
 constexpr const char *const apszTIOptions[] = {MD_RESX,
                                                MD_RESY,
@@ -112,7 +113,8 @@ constexpr const char *const apszTIOptions[] = {MD_RESX,
                                                MD_BLOCK_Y_SIZE,
                                                MD_MASK_BAND,
                                                MD_RESAMPLING,
-                                               MD_INTERLEAVE};
+                                               MD_INTERLEAVE,
+                                               MD_TRUST_FOOTPRINT};
 
 constexpr const char *const MD_BAND_OFFSET = "OFFSET";
 constexpr const char *const MD_BAND_SCALE = "SCALE";
@@ -128,6 +130,7 @@ constexpr const char *GTI_XML_LOCATIONFIELD = "LocationField";
 constexpr const char *GTI_XML_SORTFIELD = "SortField";
 constexpr const char *GTI_XML_SORTFIELDASC = "SortFieldAsc";
 constexpr const char *GTI_XML_MASKBAND = "MaskBand";
+constexpr const char *GTI_XML_TRUSTFOOTPRINT = "TrustFootprint";
 constexpr const char *GTI_XML_OVERVIEW_ELEMENT = "Overview";
 constexpr const char *GTI_XML_OVERVIEW_DATASET = "Dataset";
 constexpr const char *GTI_XML_OVERVIEW_LAYER = "Layer";
@@ -418,6 +421,14 @@ class GDALTileIndexDataset final : public GDALPamDataset
 
     //! Whereas the multi-threading rendering code path must be used. Updated by CollectSources().
     bool m_bLastMustUseMultiThreading = false;
+
+    //! Whether the tile index geometries are authoritative valid-data
+    //! footprints (TRUST_FOOTPRINT): sources hidden under a higher-priority
+    //! footprint that contains the request window are neither opened nor rendered.
+    bool m_bTrustFootprint = false;
+
+    //! Number of sources discarded by TRUST_FOOTPRINT in the last CollectSources()
+    size_t m_nLastOccludedSources = 0;
 
     //! Whether the GTI file is a STAC collection
     bool m_bSTACCollection = false;
@@ -1068,6 +1079,8 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
                 pszItem = GTI_XML_SORTFIELDASC;
             else if (EQUAL(pszItem, MD_MASK_BAND))
                 pszItem = GTI_XML_MASKBAND;
+            else if (EQUAL(pszItem, MD_TRUST_FOOTPRINT))
+                pszItem = GTI_XML_TRUSTFOOTPRINT;
             pszVal = CPLGetXMLValue(psRoot, pszItem, nullptr);
             if (pszVal)
                 return pszVal;
@@ -2441,6 +2454,9 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
         !poFirstBand->m_poColorTable)
         poFirstBand->m_poColorTable = std::move(poSingleColorTable);
 
+    if (const char *pszTrustFootprint = GetOption(MD_TRUST_FOOTPRINT))
+        m_bTrustFootprint = CPLTestBool(pszTrustFootprint);
+
     const char *pszMaskBand = GetOption(MD_MASK_BAND);
     if (pszMaskBand)
         bHasMaskBand = CPLTestBool(pszMaskBand);
@@ -2650,6 +2666,10 @@ const char *GDALTileIndexDataset::GetMetadataItem(const char *pszName,
         else if (EQUAL(pszName, "MULTI_THREADED_RASTERIO_LAST_USED"))
         {
             return m_bLastMustUseMultiThreading ? "1" : "0";
+        }
+        else if (EQUAL(pszName, "TRUST_FOOTPRINT_LAST_OCCLUDED"))
+        {
+            return CPLSPrintf("%d", static_cast<int>(m_nLastOccludedSources));
         }
     }
     return GDALPamDataset::GetMetadataItem(pszName, pszDomain);
@@ -4144,6 +4164,56 @@ int GDALTileIndexDataset::GetNumThreads() const
 }
 
 /************************************************************************/
+/*                     GTIFootprintContainsWindow()                     */
+/************************************************************************/
+
+/** Returns whether the footprint geometry of a tile (in the SRS of the tile
+ * index) fully contains the request window. Rectangular footprints are tested
+ * through their envelope only; other polygons require GEOS.
+ */
+static bool GTIFootprintContainsWindow(const OGRGeometry *poGeom,
+                                       const OGREnvelope &sWindow)
+{
+    if (!poGeom || poGeom->IsEmpty())
+        return false;
+    OGREnvelope sGeomEnvelope;
+    poGeom->getEnvelope(&sGeomEnvelope);
+    if (!sGeomEnvelope.Contains(sWindow))
+        return false;
+
+    const OGRPolygon *poPoly = nullptr;
+    const auto eType = wkbFlatten(poGeom->getGeometryType());
+    if (eType == wkbPolygon)
+    {
+        poPoly = poGeom->toPolygon();
+    }
+    else if (eType == wkbMultiPolygon)
+    {
+        const auto poMP = poGeom->toMultiPolygon();
+        if (poMP->getNumGeometries() == 1)
+            poPoly = poMP->getGeometryRef(0);
+    }
+    if (poPoly && poPoly->IsRectangle())
+        return true;
+
+    if (!OGRGeometryFactory::haveGEOS())
+    {
+        CPLDebugOnce("GTI", "TRUST_FOOTPRINT: non-rectangular footprint and "
+                            "GEOS not available: cannot test containment");
+        return false;
+    }
+    OGRLinearRing oRing;
+    oRing.addPoint(sWindow.MinX, sWindow.MinY);
+    oRing.addPoint(sWindow.MinX, sWindow.MaxY);
+    oRing.addPoint(sWindow.MaxX, sWindow.MaxY);
+    oRing.addPoint(sWindow.MaxX, sWindow.MinY);
+    oRing.addPoint(sWindow.MinX, sWindow.MinY);
+    OGRPolygon oWindowPoly;
+    oWindowPoly.addRing(&oRing);
+    return CPL_TO_BOOL(poGeom->Contains(&oWindowPoly));
+}
+
+/************************************************************************/
 /*                           CollectSources()                           */
 /************************************************************************/
 
@@ -4173,6 +4243,7 @@ bool GDALTileIndexDataset::CollectSources(double dfXOff, double dfYOff,
     if (m_bBandInterleave)
         m_anLastBands = std::vector<int>(panBandMap, panBandMap + nBandCount);
     m_bLastMustUseMultiThreading = false;
+    m_nLastOccludedSources = 0;
 
     OGRLayer *poSQLLayer = nullptr;
     if (!m_osSpatialSQL.empty())
@@ -4222,6 +4293,49 @@ bool GDALTileIndexDataset::CollectSources(double dfXOff, double dfYOff,
 
     if (poSQLLayer)
         ReleaseResultSet(poSQLLayer);
+
+    // TRUST_FOOTPRINT: the index geometries are authoritative valid-data
+    // footprints. Find the highest-priority source whose footprint contains
+    // the whole request window: the sources below it are hidden, and are
+    // neither opened nor rendered. This runs before any tile is opened.
+    bool bSorted = false;
+    if (m_bTrustFootprint && m_aoSourceDesc.size() > 1)
+    {
+        SortSourceDesc();
+        bSorted = true;
+        // Shrink the window by a small fraction of a pixel so that footprints
+        // sharing an edge with the window are not rejected by rounding noise.
+        const double dfEpsX = 1e-3 * std::fabs(m_gt.xscale);
+        const double dfEpsY = 1e-3 * std::fabs(m_gt.yscale);
+        OGREnvelope sWindow;
+        sWindow.MinX = dfMinX + dfEpsX;
+        sWindow.MaxX = dfMaxX - dfEpsX;
+        sWindow.MinY = dfMinY + dfEpsY;
+        sWindow.MaxY = dfMaxY - dfEpsY;
+        size_t nKeepFrom = 0;
+        for (size_t i = m_aoSourceDesc.size(); i > 0;)
+        {
+            --i;
+            if (GTIFootprintContainsWindow(
+                    m_aoSourceDesc[i].poFeature->GetGeometryRef(), sWindow))
+            {
+                nKeepFrom = i;
+                break;
+            }
+        }
+        if (nKeepFrom > 0)
+        {
+            CPLDebug("GTI",
+                     "TRUST_FOOTPRINT: %d source(s) hidden under the footprint "
+                     "of %s",
+                     static_cast<int>(nKeepFrom),
+                     m_aoSourceDesc[nKeepFrom].poFeature->GetFieldAsString(
+                         m_nLocationFieldIndex));
+            m_aoSourceDesc.erase(m_aoSourceDesc.begin(),
+                                 m_aoSourceDesc.begin() + nKeepFrom);
+            m_nLastOccludedSources = nKeepFrom;
+        }
+    }
 
     constexpr int MINIMUM_PIXEL_COUNT_FOR_THREADED_IO = 1000 * 1000;
     if (bMultiThreadAllowed && m_aoSourceDesc.size() > 1 &&
@@ -4308,7 +4422,7 @@ bool GDALTileIndexDataset::CollectSources(double dfXOff, double dfYOff,
         }
     }
 
-    if (m_aoSourceDesc.size() > 1)
+    if (!bSorted && m_aoSourceDesc.size() > 1)
     {
         SortSourceDesc();
     }

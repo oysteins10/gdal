@@ -21,7 +21,7 @@ import ogrtest
 import pytest
 import webserver
 
-from osgeo import gdal, ogr
+from osgeo import gdal, ogr, osr
 
 pytestmark = [pytest.mark.require_driver("GTI"), pytest.mark.require_driver("GPKG")]
 
@@ -1838,6 +1838,260 @@ def test_gti_on_the_fly_warping_per_dataset_mask(tmp_vsimem):
             0, 0, xsize, ysize, buf_xsize=buf_xsize, buf_ysize=buf_ysize
         )
         assert got == ref, (buf_xsize, buf_ysize)
+
+
+###############################################################################
+# TRUST_FOOTPRINT: footprint-based occlusion
+
+
+def _create_stacked_tiles(tmp_vsimem, top_width=20):
+    """Two tiles on the same 20x20 grid at (2,49): bottom filled with 1, top
+    (top_width pixels wide, from the left) filled with 2 with a 4x4 nodata
+    hole at (8,8). Returns (bottom_filename, top_filename)."""
+    bottom = str(tmp_vsimem / "bottom.tif")
+    ds = gdal.GetDriverByName("GTiff").Create(bottom, 20, 20)
+    ds.SetGeoTransform([2, 1, 0, 49, 0, -1])
+    ds.GetRasterBand(1).Fill(1)
+    ds = None
+    top = str(tmp_vsimem / "top.tif")
+    ds = gdal.GetDriverByName("GTiff").Create(top, top_width, 20)
+    ds.SetGeoTransform([2, 1, 0, 49, 0, -1])
+    ds.GetRasterBand(1).SetNoDataValue(0)
+    ds.GetRasterBand(1).Fill(2)
+    if top_width > 12:
+        ds.GetRasterBand(1).WriteRaster(8, 8, 4, 4, b"\x00" * 16)
+    ds = None
+    return bottom, top
+
+
+def _create_stacked_index(
+    tmp_vsimem,
+    bottom_location,
+    top_location,
+    top_wkt=None,
+    trust_footprint=None,
+    lyr_srs=None,
+):
+    """GPKG index with SORT_FIELD=prio: bottom (prio 1) below top (prio 2).
+    Geometries are the tile extents unless top_wkt is given."""
+    index_filename = str(tmp_vsimem / "index.gti.gpkg")
+    index_ds = ogr.GetDriverByName("GPKG").CreateDataSource(index_filename)
+    lyr = index_ds.CreateLayer("index", srs=lyr_srs)
+    lyr.CreateField(ogr.FieldDefn("location"))
+    lyr.CreateField(ogr.FieldDefn("prio", ogr.OFTInteger))
+    for location, prio, wkt in (
+        (bottom_location, 1, "POLYGON((2 29,2 49,22 49,22 29,2 29))"),
+        (top_location, 2, top_wkt or "POLYGON((2 29,2 49,22 49,22 29,2 29))"),
+    ):
+        f = ogr.Feature(lyr.GetLayerDefn())
+        f["location"] = location
+        f["prio"] = prio
+        f.SetGeometry(ogr.CreateGeometryFromWkt(wkt))
+        lyr.CreateFeature(f)
+    lyr.SetMetadataItem("SORT_FIELD", "prio")
+    # Declare the mosaic characteristics so that opening the index does not
+    # need to open a tile (relevant for the "hidden tile is missing" test).
+    for k, v in (
+        ("BAND_COUNT", "1"), ("DATA_TYPE", "Byte"), ("NODATA", "0"),
+        ("RESX", "1"), ("RESY", "1"),
+        ("MINX", "2"), ("MINY", "29"), ("MAXX", "22"), ("MAXY", "49"),
+    ):
+        lyr.SetMetadataItem(k, v)
+    if trust_footprint is not None:
+        lyr.SetMetadataItem("TRUST_FOOTPRINT", trust_footprint)
+    del index_ds
+    return index_filename
+
+
+def _occluded(ds):
+    return ds.GetMetadataItem("TRUST_FOOTPRINT_LAST_OCCLUDED", "__DEBUG__")
+
+
+def test_gti_trust_footprint_default_off(tmp_vsimem):
+
+    bottom, top = _create_stacked_tiles(tmp_vsimem)
+    index_filename = _create_stacked_index(tmp_vsimem, bottom, top)
+    ds = gdal.Open(index_filename)
+    data = ds.GetRasterBand(1).ReadRaster()
+    # the nodata hole of the top tile is filled by the bottom tile
+    assert data[8 * 20 + 8] == 1
+    assert data[0] == 2
+    assert _occluded(ds) == "0"
+    assert ds.GetMetadataItem("NUMBER_OF_CONTRIBUTING_SOURCES", "__DEBUG__") == "2"
+
+
+def test_gti_trust_footprint_occludes(tmp_vsimem):
+
+    bottom, top = _create_stacked_tiles(tmp_vsimem)
+    index_filename = _create_stacked_index(
+        tmp_vsimem, bottom, top, trust_footprint="YES"
+    )
+    ds = gdal.Open(index_filename)
+    data = ds.GetRasterBand(1).ReadRaster()
+    # the footprint of the top tile is authoritative: its hole is NOT filled
+    assert data[8 * 20 + 8] == 0
+    assert data[0] == 2
+    assert _occluded(ds) == "1"
+    assert ds.GetMetadataItem("NUMBER_OF_CONTRIBUTING_SOURCES", "__DEBUG__") == "1"
+    # a sub-window read is occluded too
+    assert ds.GetRasterBand(1).ReadRaster(1, 1, 5, 5) == b"\x02" * 25
+    assert _occluded(ds) == "1"
+
+
+def test_gti_trust_footprint_does_not_open_hidden_tiles(tmp_vsimem):
+
+    _, top = _create_stacked_tiles(tmp_vsimem)
+    missing = str(tmp_vsimem / "i_do_not_exist.tif")
+
+    # Without the flag, the hidden tile is opened (and fails)
+    index_filename = _create_stacked_index(tmp_vsimem, missing, top)
+    ds = gdal.Open(index_filename)
+    with pytest.raises(Exception):
+        ds.GetRasterBand(1).ReadRaster()
+    ds = None
+
+    # With the flag it is never opened
+    index_filename = _create_stacked_index(
+        tmp_vsimem, missing, top, trust_footprint="YES"
+    )
+    ds = gdal.Open(index_filename)
+    data = ds.GetRasterBand(1).ReadRaster()
+    assert data[0] == 2
+    assert _occluded(ds) == "1"
+
+
+def test_gti_trust_footprint_partial_cover(tmp_vsimem):
+
+    # top tile only covers the left half (x in [2, 12])
+    bottom, top = _create_stacked_tiles(tmp_vsimem, top_width=10)
+    index_filename = _create_stacked_index(
+        tmp_vsimem,
+        bottom,
+        top,
+        top_wkt="POLYGON((2 29,2 49,12 49,12 29,2 29))",
+        trust_footprint="YES",
+    )
+    ds = gdal.Open(index_filename)
+    data = ds.GetRasterBand(1).ReadRaster()
+    assert data[0] == 2 and data[19] == 1  # left: top, right: bottom
+    assert _occluded(ds) == "0"
+    # window fully inside the top footprint: bottom is skipped
+    assert ds.GetRasterBand(1).ReadRaster(1, 1, 8, 8) == b"\x02" * 64
+    assert _occluded(ds) == "1"
+    # window crossing the top footprint edge: both are used
+    assert ds.GetRasterBand(1).ReadRaster(8, 1, 4, 1) == b"\x02\x02\x01\x01"
+    assert _occluded(ds) == "0"
+
+
+def test_gti_trust_footprint_non_rectangular(tmp_vsimem):
+
+    if not ogrtest.have_geos():
+        pytest.skip("GEOS missing")
+
+    bottom, top = _create_stacked_tiles(tmp_vsimem)
+    # triangular footprint for the top tile (lower-left half of its extent)
+    index_filename = _create_stacked_index(
+        tmp_vsimem,
+        bottom,
+        top,
+        top_wkt="POLYGON((2 29,2 49,22 29,2 29))",
+        trust_footprint="YES",
+    )
+    ds = gdal.Open(index_filename)
+    # window well inside the triangle (pixel (1..3, 15..17) -> x 3..5, y 32..34)
+    assert ds.GetRasterBand(1).ReadRaster(1, 15, 3, 3) == b"\x02" * 9
+    assert _occluded(ds) == "1"
+    # whole extent: the triangle does not contain it
+    ds.GetRasterBand(1).ReadRaster()
+    assert _occluded(ds) == "0"
+
+
+def test_gti_trust_footprint_open_option_and_xml(tmp_vsimem):
+
+    bottom, top = _create_stacked_tiles(tmp_vsimem)
+    index_filename = _create_stacked_index(tmp_vsimem, bottom, top)
+
+    ds = gdal.OpenEx(index_filename, open_options=["TRUST_FOOTPRINT=YES"])
+    assert ds.GetRasterBand(1).ReadRaster()[8 * 20 + 8] == 0
+    assert _occluded(ds) == "1"
+    ds = None
+
+    xml_filename = str(tmp_vsimem / "index.gti")
+    gdal.FileFromMemBuffer(
+        xml_filename,
+        f"""<GDALTileIndexDataset>
+    <IndexDataset>{index_filename}</IndexDataset>
+    <TrustFootprint>true</TrustFootprint>
+    <Overview><Factor>2</Factor></Overview>
+</GDALTileIndexDataset>""",
+    )
+    ds = gdal.Open(xml_filename)
+    assert ds.GetRasterBand(1).ReadRaster()[8 * 20 + 8] == 0
+    assert _occluded(ds) == "1"
+    # implicit overview level inherits the flag
+    ovr_band = ds.GetRasterBand(1).GetOverview(0)
+    assert ovr_band.XSize == 10
+    ovr_band.ReadRaster()
+    assert _occluded(ovr_band.GetDataset()) == "1"
+
+
+def test_gti_trust_footprint_reprojected_index(tmp_vsimem):
+
+    if not ogrtest.have_geos():
+        pytest.skip("GEOS missing")
+
+    # Tiles in UTM, index geometries in WGS84 + SRS_BEHAVIOR=REPROJECT
+    utm = osr.SpatialReference()
+    utm.ImportFromEPSG(32631)
+    wgs84 = osr.SpatialReference()
+    wgs84.ImportFromEPSG(4326)
+    wgs84.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    gt = [500000, 60, 0, 4500000, 0, -60]
+    tiles = []
+    for name, value in (("bottom", 1), ("top", 2)):
+        filename = str(tmp_vsimem / f"{name}_utm.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(filename, 20, 20)
+        ds.SetGeoTransform(gt)
+        ds.SetSpatialRef(utm)
+        ds.GetRasterBand(1).SetNoDataValue(0)
+        ds.GetRasterBand(1).Fill(value)
+        if value == 2:
+            ds.GetRasterBand(1).WriteRaster(8, 8, 4, 4, b"\x00" * 16)
+        ds = None
+        tiles.append(filename)
+
+    ring = ogr.Geometry(ogr.wkbLinearRing)
+    for px, py in ((0, 0), (0, 20), (20, 20), (20, 0), (0, 0)):
+        ring.AddPoint_2D(gt[0] + px * gt[1], gt[3] + py * gt[5])
+    footprint = ogr.Geometry(ogr.wkbPolygon)
+    footprint.AddGeometry(ring)
+    footprint.AssignSpatialReference(utm)
+    footprint.TransformTo(wgs84)
+    wkt = footprint.ExportToWkt()
+
+    index_filename = str(tmp_vsimem / "index.gti.gpkg")
+    index_ds = ogr.GetDriverByName("GPKG").CreateDataSource(index_filename)
+    lyr = index_ds.CreateLayer("index", srs=wgs84)
+    lyr.CreateField(ogr.FieldDefn("location"))
+    lyr.CreateField(ogr.FieldDefn("prio", ogr.OFTInteger))
+    for location, prio in ((tiles[0], 1), (tiles[1], 2)):
+        f = ogr.Feature(lyr.GetLayerDefn())
+        f["location"] = location
+        f["prio"] = prio
+        f.SetGeometry(ogr.CreateGeometryFromWkt(wkt))
+        lyr.CreateFeature(f)
+    lyr.SetMetadataItem("SORT_FIELD", "prio")
+    lyr.SetMetadataItem("SRS", "EPSG:32631")
+    lyr.SetMetadataItem("SRS_BEHAVIOR", "REPROJECT")
+    lyr.SetMetadataItem("RESX", "60")
+    lyr.SetMetadataItem("RESY", "60")
+    lyr.SetMetadataItem("TRUST_FOOTPRINT", "YES")
+    del index_ds
+
+    ds = gdal.Open(index_filename)
+    # window well inside the (reprojected, hence non-rectangular) footprint
+    assert ds.GetRasterBand(1).ReadRaster(2, 2, 4, 4) == b"\x02" * 16
+    assert _occluded(ds) == "1"
 
 
 def test_gti_single_source_alpha_no_dest_nodata(tmp_vsimem):

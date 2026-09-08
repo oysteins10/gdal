@@ -58,6 +58,7 @@
                     <xs:element name="NoDataValue" type="DoubleOrNanType"/>  <!-- single value that applies to all bands -->
 
                     <xs:element name="MaskBand" type="OGRBooleanType"/>
+                    <xs:element name="TrustFootprint" type="OGRBooleanType"/>
 
                     <xs:element name="Band" type="BandType"/> <!-- may be repeated -->
                     <xs:element name="Overview" type="OverviewType"/>  <!-- may be repeated -->
