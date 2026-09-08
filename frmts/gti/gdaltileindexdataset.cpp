@@ -3860,6 +3860,7 @@ bool GDALTileIndexDataset::GetSourceDesc(const std::string &osTileName,
         bool bWarpVRT = false;
         bool bExportSRS = false;
         bool bAddAlphaToVRT = false;
+        bool bPropagateMaskAsAlpha = false;
         const OGRSpatialReference *poTileSRS = poTileDS->GetSpatialRef();
         GDALGeoTransform tileGT;
         if (!m_oSRS.IsEmpty() && poTileSRS != nullptr &&
@@ -3894,6 +3895,22 @@ bool GDALTileIndexDataset::GetSourceDesc(const std::string &osTileName,
 
         if (bWarpVRT)
         {
+            // A warped VRT has no mask band of its own: the warper honours the
+            // per-dataset mask of the tile to decide which pixels it writes,
+            // but that validity information is lost afterwards, and the
+            // whole rectangle of the warped source would be considered valid
+            // when compositing or when exposing the GTI mask band. Ask the
+            // warper to materialize it as an alpha band, which is detected
+            // below as the mask band of the source.
+            if (!bAddAlphaToVRT &&
+                poTileDS->GetRasterBand(poTileDS->GetRasterCount())
+                        ->GetColorInterpretation() != GCI_AlphaBand &&
+                (poTileDS->GetRasterBand(1)->GetMaskFlags() &
+                 GMF_PER_DATASET) != 0)
+            {
+                bPropagateMaskAsAlpha = true;
+            }
+
             CPLStringList aosOptions;
             aosOptions.AddString("-of");
             aosOptions.AddString("VRT");
@@ -3998,7 +4015,7 @@ bool GDALTileIndexDataset::GetSourceDesc(const std::string &osTileName,
                 }
             }
 
-            if (bAddAlphaToVRT)
+            if (bAddAlphaToVRT || bPropagateMaskAsAlpha)
                 aosOptions.AddString("-dstalpha");
 
             if (!m_osWarpMemory.empty())

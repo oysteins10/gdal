@@ -1764,6 +1764,67 @@ def test_gti_on_the_fly_warping(tmp_vsimem):
     assert vrt_ds.GetRasterBand(1).ReadRaster(0, 0, 1, 1) == b"\xfe"
 
 
+def test_gti_on_the_fly_warping_per_dataset_mask(tmp_vsimem):
+    """Check that the per-dataset mask of a tile that requires on-the-fly
+    reprojection is propagated to the GTI mask band (and to compositing),
+    instead of the whole rectangle of the warped source being considered
+    valid (https://github.com/OSGeo/gdal/issues/XXXX)."""
+
+    tile_filename = str(tmp_vsimem / "tile.tif")
+    with gdal.config_option("GDAL_TIFF_INTERNAL_MASK", "YES"):
+        tile_ds = gdal.GetDriverByName("GTiff").Create(tile_filename, 20, 20, 3)
+        tile_ds.SetGeoTransform([440720, 60, 0, 3751320, 0, -60])
+        tile_ds.SetProjection("EPSG:26711")
+        for i in range(3):
+            tile_ds.GetRasterBand(i + 1).Fill(100 + i)
+        tile_ds.CreateMaskBand(gdal.GMF_PER_DATASET)
+        mask_band = tile_ds.GetRasterBand(1).GetMaskBand()
+        mask_band.Fill(255)
+        # Left half of the tile is invalid
+        mask_band.WriteRaster(0, 0, 10, 20, b"\x00" * (10 * 20))
+        tile_ds = None
+
+    tile_ds = gdal.Open(tile_filename)
+    assert tile_ds.GetRasterBand(1).GetMaskFlags() == gdal.GMF_PER_DATASET
+
+    # Index in another SRS: the tile will be warped on the fly
+    warped_ds = gdal.Warp("", tile_ds, format="VRT", dstSRS="EPSG:4267")
+    warped_gt = warped_ds.GetGeoTransform()
+    minx = warped_gt[0]
+    maxx = minx + warped_ds.RasterXSize * warped_gt[1]
+    maxy = warped_gt[3]
+    miny = maxy + warped_ds.RasterYSize * warped_gt[5]
+
+    index_filename = str(tmp_vsimem / "index.gti.gpkg")
+    index_ds = ogr.GetDriverByName("GPKG").CreateDataSource(index_filename)
+    lyr = index_ds.CreateLayer("index", srs=warped_ds.GetSpatialRef())
+    lyr.CreateField(ogr.FieldDefn("location"))
+    f = ogr.Feature(lyr.GetLayerDefn())
+    f["location"] = tile_filename
+    f.SetGeometry(
+        ogr.CreateGeometryFromWkt(
+            f"POLYGON(({minx} {miny},{minx} {maxy},{maxx} {maxy},{maxx} {miny},{minx} {miny}))"
+        )
+    )
+    lyr.CreateFeature(f)
+    lyr.SetMetadataItem("MASK_BAND", "YES")
+    del index_ds
+
+    vrt_ds = gdal.Open(index_filename)
+    assert vrt_ds.RasterCount == 3
+    assert vrt_ds.GetRasterBand(1).GetMaskFlags() == gdal.GMF_PER_DATASET
+    mask = vrt_ds.GetRasterBand(1).GetMaskBand().ReadRaster()
+    data = vrt_ds.GetRasterBand(1).ReadRaster()
+    # Part of the mosaic is invalid: the left half of the tile, and the corners
+    # of the rectangle not covered by the rotated tile footprint
+    assert b"\x00" in mask
+    assert b"\xff" in mask
+    # The mask must match the pixels actually written by the warper
+    for m, d in zip(mask, data):
+        assert (m != 0) == (d != 0)
+    assert set(data) == {0, 100}
+
+
 def test_gti_single_source_alpha_no_dest_nodata(tmp_vsimem):
 
     filename1 = str(tmp_vsimem / "one.tif")
