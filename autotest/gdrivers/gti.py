@@ -4553,3 +4553,72 @@ def test_gti_srs_no_layer_srs_silent(tmp_vsimem):
         ds = gdal.OpenEx(index_filename, open_options=["SRS=EPSG:3857"])
     assert ds is not None
     assert ds.GetSpatialRef().GetAuthorityCode() == "3857"
+
+
+def test_gti_implicit_overview_shares_sql_result_layer(tmp_vsimem):
+    """A <SQL> index: implicit <Overview><Factor> levels reuse the parent's result
+    layer instead of executing the statement again on the shared connection (a
+    second result set on one connection is not safe with e.g. PostgreSQL)."""
+
+    tiles = []
+    for i, val in enumerate((1, 2)):
+        fn = str(tmp_vsimem / f"t{i}.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(fn, 40, 40)
+        ds.SetGeoTransform([2 + 40 * i, 1, 0, 49, 0, -1])
+        ds.GetRasterBand(1).Fill(val)
+        ds = None
+        tiles.append(fn)
+    index_filename = str(tmp_vsimem / "index.gti.gpkg")
+    index_ds = ogr.GetDriverByName("GPKG").CreateDataSource(index_filename)
+    lyr = index_ds.CreateLayer("tiles")
+    lyr.CreateField(ogr.FieldDefn("location"))
+    lyr.CreateField(ogr.FieldDefn("category"))
+    for i, cat in enumerate(("a", "b")):
+        f = ogr.Feature(lyr.GetLayerDefn())
+        f["location"] = tiles[i]
+        f["category"] = cat
+        x0 = 2 + 40 * i
+        f.SetGeometry(ogr.CreateGeometryFromWkt(
+            f"POLYGON(({x0} 9,{x0} 49,{x0 + 40} 49,{x0 + 40} 9,{x0} 9))"))
+        lyr.CreateFeature(f)
+    del index_ds
+    xml_filename = str(tmp_vsimem / "index.gti")
+    gdal.FileFromMemBuffer(
+        xml_filename,
+        f"""<GDALTileIndexDataset>
+    <IndexDataset>{index_filename}</IndexDataset>
+    <SQL>SELECT * FROM tiles WHERE category = 'a'</SQL>
+    <BandCount>1</BandCount><DataType>Byte</DataType><ResX>1</ResX><ResY>1</ResY>
+    <Overview><Factor>2</Factor></Overview>
+    <Overview><Factor>4</Factor></Overview>
+</GDALTileIndexDataset>""",
+    )
+
+    ds = gdal.Open(xml_filename)
+    assert (ds.RasterXSize, ds.RasterYSize) == (40, 40)  # tile 'a' only
+    band = ds.GetRasterBand(1)
+    assert band.GetOverviewCount() == 2
+    ovr0, ovr1 = (band.GetOverview(i) for i in range(2))
+    for ovr in (ovr0, ovr1):
+        ovr_ds = ovr.GetDataset()
+        assert ovr_ds.GetMetadataItem("INDEX_DATASET_SHARED_WITH_PARENT", "__DEBUG__") == "YES"
+        assert ovr_ds.GetMetadataItem("INDEX_LAYER_SHARED_WITH_PARENT", "__DEBUG__") == "YES"
+    assert (ovr0.XSize, ovr0.YSize) == (20, 20)
+    assert ovr0.GetDataset().GetGeoTransform() == (2, 2, 0, 49, 0, -2)
+    assert ovr0.ReadRaster(0, 0, 20, 20) == b"\x01" * 400
+    assert (ovr1.XSize, ovr1.YSize) == (10, 10)
+    assert ovr1.ReadRaster(0, 0, 10, 10) == b"\x01" * 100
+    # the parent works after its levels used the shared layer, and vice versa
+    assert band.ReadRaster(0, 0, 40, 40) == b"\x01" * 1600
+    assert band.ReadRaster(0, 0, 40, 40, 20, 20) == ovr0.ReadRaster(0, 0, 20, 20)
+    assert band.ReadRaster(0, 0, 40, 40, 10, 10) == ovr1.ReadRaster(0, 0, 10, 10)
+    assert ovr0.ReadRaster(0, 0, 20, 20) == b"\x01" * 400
+    assert band.Checksum() == band.Checksum()
+    ds = None  # levels are closed before the parent releases the result set
+
+    # a SQL open option is not shared: the level executes its own statement
+    ds = gdal.OpenEx(xml_filename, open_options=["SQL=SELECT * FROM tiles WHERE category = 'b'"])
+    assert ds.GetRasterBand(1).GetOverview(0).GetDataset().GetMetadataItem(
+        "INDEX_LAYER_SHARED_WITH_PARENT", "__DEBUG__") == "NO"
+    assert ds.GetRasterBand(1).GetOverview(0).ReadRaster(0, 0, 20, 20) == b"\x02" * 400
+    ds = None

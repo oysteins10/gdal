@@ -283,6 +283,10 @@ class GDALTileIndexDataset final : public GDALPamDataset
     //! this one is an implicit overview level of.
     bool m_bVectorDSSharedWithParent = false;
 
+    //! Whether m_poLayer is the parent's ExecuteSQL() result layer, which the
+    //! parent owns and releases (implicit overview level of a <SQL> index)
+    bool m_bLayerSharedWithParent = false;
+
     //! When the SRS of m_poLayer is not the one we expose
     std::unique_ptr<OGRWarpedLayer> m_poWarpedLayerKeeper{};
 
@@ -974,7 +978,6 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
     }
 
     if (poParentForImplicitOverview && poParentForImplicitOverview->m_poVectorDS &&
-        !poParentForImplicitOverview->m_poLayerToRelease &&
         strcmp(poParentForImplicitOverview->GetDescription(),
                poOpenInfo->pszFilename) == 0)
     {
@@ -1105,14 +1108,30 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
     }
     else if (!m_osSQL.empty())
     {
-        m_poLayer = m_poVectorDS->ExecuteSQL(m_osSQL.c_str(), nullptr, nullptr);
-        if (!m_poLayer)
+        if (m_bVectorDSSharedWithParent &&
+            poParentForImplicitOverview->m_poLayerToRelease &&
+            poParentForImplicitOverview->m_osSQL == m_osSQL)
         {
-            CPLError(CE_Failure, CPLE_AppDefined, "SQL request %s failed",
-                     m_osSQL.c_str());
-            return false;
+            // Implicit overview level of a <SQL> index: reuse the parent's
+            // result set rather than executing the statement again on the
+            // shared connection (a second result set on one connection is
+            // not safe with every driver, e.g. PostgreSQL cursors). The
+            // parent owns and releases it, after closing its levels.
+            m_poLayer = poParentForImplicitOverview->m_poLayerToRelease;
+            m_bLayerSharedWithParent = true;
         }
-        m_poLayerToRelease = m_poLayer;
+        else
+        {
+            m_poLayer =
+                m_poVectorDS->ExecuteSQL(m_osSQL.c_str(), nullptr, nullptr);
+            if (!m_poLayer)
+            {
+                CPLError(CE_Failure, CPLE_AppDefined, "SQL request %s failed",
+                         m_osSQL.c_str());
+                return false;
+            }
+            m_poLayerToRelease = m_poLayer;
+        }
     }
     else if (m_poVectorDS->GetLayerCount() == 1)
     {
@@ -2837,6 +2856,10 @@ const char *GDALTileIndexDataset::GetMetadataItem(const char *pszName,
         {
             return m_bVectorDSSharedWithParent ? "YES" : "NO";
         }
+        else if (EQUAL(pszName, "INDEX_LAYER_SHARED_WITH_PARENT"))
+        {
+            return m_bLayerSharedWithParent ? "YES" : "NO";
+        }
     }
     return GDALPamDataset::GetMetadataItem(pszName, pszDomain);
 }
@@ -3000,6 +3023,10 @@ static GDALDataset *GDALTileIndexDatasetOpen(GDALOpenInfo *poOpenInfo)
 
 GDALTileIndexDataset::~GDALTileIndexDataset()
 {
+    // Implicit overview levels may use our vector dataset and, for a <SQL>
+    // index, our result layer: close them before releasing either.
+    m_apoOverviews.clear();
+
     if (m_poVectorDS && m_poLayerToRelease)
     {
         // Reset the warped layer before releasing the SQL result layer, since
@@ -3230,11 +3257,10 @@ void GDALTileIndexDataset::LoadOverviews()
                 // Implicit level of this very index: hand over the opened
                 // index dataset (see g_poParentForImplicitOverview) and our
                 // extent, so that the level neither reconnects to the index
-                // nor queries the layer extent again. Not when the layer
-                // comes from ExecuteSQL(): a second result set on the same
-                // connection is not safe with every driver.
-                if (m_poVectorDS && !m_poLayerToRelease &&
-                    !aosNewOpenOptions.FetchNameValue("SQL"))
+                // nor queries the layer extent again. A <SQL> index hands
+                // over its result layer as well (see Open()). Not with a SQL
+                // open option: the level would re-execute that statement.
+                if (m_poVectorDS && !aosNewOpenOptions.FetchNameValue("SQL"))
                 {
                     g_poParentForImplicitOverview = this;
                 }
