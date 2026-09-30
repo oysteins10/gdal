@@ -244,6 +244,9 @@ class GDALTileIndexDataset final : public GDALPamDataset
   private:
     friend class GDALTileIndexBand;
 
+    void SetOverviewFilterAndSort(CPLStringList &aosOptions) const;
+    void SetOverviewExtent(CPLStringList &aosOptions) const;
+
     /** Directory where the main (.xml / .gti.gpkg) file is located.
      * Used for relative filenames resolution.
      */
@@ -351,6 +354,13 @@ class GDALTileIndexDataset final : public GDALPamDataset
 
     //! Whether sorting must be ascending (true) or descending (false).
     bool m_bSortFieldAsc = true;
+
+    //! Effective FILTER (open option, XML or layer metadata), empty if none.
+    //! Overviews indexing the same items are opened with it.
+    std::string m_osFilter{};
+
+    //! Name of the effective SORT_FIELD, empty if none.
+    std::string m_osSortFieldName{};
 
     //! Resampling method by default for warping or when a source has not
     //! the same resolution as the tile index.
@@ -1256,6 +1266,7 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
     {
         if (m_poLayer->SetAttributeFilter(pszFilter) != OGRERR_NONE)
             return false;
+        m_osFilter = pszFilter;
     }
 
     const OGRFeatureDefn *poLayerDefn = m_poLayer->GetLayerDefn();
@@ -1374,6 +1385,8 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
                      "Unsupported type for field %s", pszSortFieldName);
             return false;
         }
+
+        m_osSortFieldName = pszSortFieldName;
 
         const char *pszSortFieldAsc = GetOption(MD_SORT_FIELD_ASC);
         if (pszSortFieldAsc)
@@ -3185,6 +3198,76 @@ CPLErr GDALTileIndexDataset::FlushCache(bool bAtClosing)
 }
 
 /************************************************************************/
+/*                     IsTileIndexOverviewDataset()                     */
+/************************************************************************/
+
+//! Whether an <Overview><Dataset> is a tile index, whose rows FILTER and
+//! SORT_FIELD can apply to, rather than any other raster.
+static bool IsTileIndexOverviewDataset(const std::string &osDSName)
+{
+    if (cpl::starts_with(osDSName, GTI_PREFIX) ||
+        cpl::starts_with(osDSName, "<GDALTileIndexDataset"))
+        return true;
+    GDALOpenInfo oOpenInfo(osDSName.c_str(), GDAL_OF_RASTER);
+    return GDALTileIndexDatasetIdentify(&oOpenInfo) != GDAL_IDENTIFY_FALSE;
+}
+
+/************************************************************************/
+/*                      SetOverviewFilterAndSort()                      */
+/************************************************************************/
+
+//! Set the FILTER and sort order an overview indexing the same items must
+//! follow: our filter AND the overview's own, and our sort order. An overview
+//! is the same mosaic at a lower resolution, so it selects and stacks items
+//! as we do.
+void GDALTileIndexDataset::SetOverviewFilterAndSort(
+    CPLStringList &aosOptions) const
+{
+    if (!m_osFilter.empty())
+    {
+        const char *pszOwnFilter = aosOptions.FetchNameValue("FILTER");
+        // std::string, not CPLSPrintf: a filter can be longer than its buffer
+        const std::string osFilter =
+            pszOwnFilter && pszOwnFilter[0]
+                ? "(" + m_osFilter + ") AND (" + std::string(pszOwnFilter) + ")"
+                : m_osFilter;
+        aosOptions.SetNameValue("FILTER", osFilter.c_str());
+    }
+    if (!m_osSortFieldName.empty())
+    {
+        aosOptions.SetNameValue(MD_SORT_FIELD, m_osSortFieldName.c_str());
+        aosOptions.SetNameValue(MD_SORT_FIELD_ASC,
+                                m_bSortFieldAsc ? "YES" : "NO");
+    }
+}
+
+/************************************************************************/
+/*                         SetOverviewExtent()                          */
+/************************************************************************/
+
+//! Give an overview that is a tile index our extent, unless its options set
+//! one: all overviews must have exactly the extent of the full resolution
+//! mosaic, and a tile index would otherwise compute its own from its rows.
+void GDALTileIndexDataset::SetOverviewExtent(CPLStringList &aosOptions) const
+{
+    if (m_gt.xrot == 0 && m_gt.yrot == 0 &&
+        !aosOptions.FetchNameValue(MD_MINX) &&
+        !aosOptions.FetchNameValue(MD_MINY) &&
+        !aosOptions.FetchNameValue(MD_MAXX) &&
+        !aosOptions.FetchNameValue(MD_MAXY))
+    {
+        aosOptions.SetNameValue(MD_MINX, CPLSPrintf("%.17g", m_gt.xorig));
+        aosOptions.SetNameValue(
+            MD_MAXX,
+            CPLSPrintf("%.17g", m_gt.xorig + m_gt.xscale * nRasterXSize));
+        aosOptions.SetNameValue(MD_MAXY, CPLSPrintf("%.17g", m_gt.yorig));
+        aosOptions.SetNameValue(
+            MD_MINY,
+            CPLSPrintf("%.17g", m_gt.yorig + m_gt.yscale * nRasterYSize));
+    }
+}
+
+/************************************************************************/
 /*                           LoadOverviews()                            */
 /************************************************************************/
 
@@ -3203,18 +3286,20 @@ void GDALTileIndexDataset::LoadOverviews()
             }
             if (osDSName.empty())
             {
-                // Implicit overview of this very dataset: inherit the open
-                // options that select and order the tiles (FILTER, SORT_FIELD,
-                // ...), otherwise the overview would describe the unfiltered
-                // mosaic, with a different extent than this dataset, and
-                // downsampled reads would land at the wrong place. Options
-                // defining the resolution are replaced by @FACTOR.
+                // Implicit overview of this very dataset: inherit our open
+                // options (MASK_BAND, ...). Options defining the resolution
+                // are replaced by @FACTOR; FILTER, SORT_FIELD and
+                // SORT_FIELD_ASC are set below, as for every overview
+                // indexing the same items.
                 for (const auto &[pszKey, pszValue] : cpl::IterateNameValue(
                          static_cast<CSLConstList>(GetOpenOptions())))
                 {
                     if (EQUAL(pszKey, MD_RESX) || EQUAL(pszKey, MD_RESY) ||
                         EQUAL(pszKey, MD_XSIZE) || EQUAL(pszKey, MD_YSIZE) ||
                         EQUAL(pszKey, MD_GEOTRANSFORM) ||
+                        EQUAL(pszKey, "FILTER") ||
+                        EQUAL(pszKey, MD_SORT_FIELD) ||
+                        EQUAL(pszKey, MD_SORT_FIELD_ASC) ||
                         STARTS_WITH_CI(pszKey, "OVERVIEW_") ||
                         STARTS_WITH_CI(pszKey, "@") ||
                         aosNewOpenOptions.FetchNameValue(pszKey))
@@ -3252,36 +3337,31 @@ void GDALTileIndexDataset::LoadOverviews()
                 }
             }
 
-            if (osResolvedDSName.empty())
+            // An implicit level is this very index; a <Dataset> that is a
+            // tile index holds the same items at a coarser resolution. Both
+            // show the mosaic with our filter and sort order, over our extent.
+            const bool bImplicit = osResolvedDSName.empty();
+            if (bImplicit || IsTileIndexOverviewDataset(osResolvedDSName))
             {
-                // Implicit level of this very index: hand over the opened
-                // index dataset (see g_poParentForImplicitOverview) and our
-                // extent, so that the level neither reconnects to the index
-                // nor queries the layer extent again. A <SQL> index hands
-                // over its result layer as well (see Open()). Not with a SQL
-                // open option: the level would re-execute that statement.
-                if (m_poVectorDS && !aosNewOpenOptions.FetchNameValue("SQL"))
+                SetOverviewFilterAndSort(aosNewOpenOptions);
+                SetOverviewExtent(aosNewOpenOptions);
+            }
+            if (bImplicit)
+            {
+                // Hand over the opened index dataset (see
+                // g_poParentForImplicitOverview), so that the level neither
+                // reconnects to the index nor queries the layer extent again.
+                // A <SQL> index hands over its result layer as well (see
+                // Open()). Not with a SQL open option: the level would
+                // re-execute that statement. Not when the level narrows the
+                // filter with its own: it would set that filter on the layer
+                // object it shares with us.
+                const char *pszLevelFilter =
+                    aosNewOpenOptions.FetchNameValue("FILTER");
+                if (m_poVectorDS && !aosNewOpenOptions.FetchNameValue("SQL") &&
+                    m_osFilter == (pszLevelFilter ? pszLevelFilter : ""))
                 {
                     g_poParentForImplicitOverview = this;
-                }
-                if (m_gt.xrot == 0 && m_gt.yrot == 0 &&
-                    !aosNewOpenOptions.FetchNameValue(MD_MINX) &&
-                    !aosNewOpenOptions.FetchNameValue(MD_MINY) &&
-                    !aosNewOpenOptions.FetchNameValue(MD_MAXX) &&
-                    !aosNewOpenOptions.FetchNameValue(MD_MAXY))
-                {
-                    aosNewOpenOptions.SetNameValue(
-                        MD_MINX, CPLSPrintf("%.17g", m_gt.xorig));
-                    aosNewOpenOptions.SetNameValue(
-                        MD_MAXX, CPLSPrintf("%.17g", m_gt.xorig +
-                                                    m_gt.xscale *
-                                                        nRasterXSize));
-                    aosNewOpenOptions.SetNameValue(
-                        MD_MAXY, CPLSPrintf("%.17g", m_gt.yorig));
-                    aosNewOpenOptions.SetNameValue(
-                        MD_MINY, CPLSPrintf("%.17g", m_gt.yorig +
-                                                    m_gt.yscale *
-                                                        nRasterYSize));
                 }
             }
             std::unique_ptr<GDALDataset, GDALDatasetUniquePtrReleaser> poOvrDS(

@@ -4622,3 +4622,214 @@ def test_gti_implicit_overview_shares_sql_result_layer(tmp_vsimem):
         "INDEX_LAYER_SHARED_WITH_PARENT", "__DEBUG__") == "NO"
     assert ds.GetRasterBand(1).GetOverview(0).ReadRaster(0, 0, 20, 20) == b"\x02" * 400
     ds = None
+
+
+###############################################################################
+# Overviews follow FILTER, SORT_FIELD and SORT_FIELD_ASC.
+#
+# Two items with cat = zorder = 1 and 2, side by side on [2, 42] and [42, 82]
+# x [9, 49] (or both on [2, 82] with _FS_OVERLAP). The base index holds them at
+# 1 m with tile values 1 and 2; a coarser tile index holds them at 2 m with
+# values 11 and 12 (4 m: 21 and 22), so a read tells which level answered.
+
+_FS_SIDE = ((2, 42), (42, 82))
+_FS_OVERLAP = ((2, 82), (2, 82))
+
+
+def _fs_tile(filename, x0, x1, res, value):
+    """A 1-band Byte tile of `value` covering [x0, x1] x [9, 49] at `res`."""
+    ds = gdal.GetDriverByName("GTiff").Create(
+        filename, int((x1 - x0) / res), int(40 / res)
+    )
+    ds.SetGeoTransform([x0, res, 0, 49, 0, -res])
+    ds.GetRasterBand(1).Fill(value)
+    ds = None
+    return filename
+
+
+def _fs_items(
+    tmp_vsimem,
+    name,
+    res,
+    values,
+    spans=_FS_SIDE,
+    driver="GPKG",
+    fields=("cat", "zorder"),
+    metadata=None,
+):
+    """A tile index of the two items at `res`, with tile values `values`."""
+    ext = {"GPKG": ".gti.gpkg", "GeoJSON": ".geojson"}[driver]
+    filename = str(tmp_vsimem / (name + ext))
+    ds = ogr.GetDriverByName(driver).CreateDataSource(filename)
+    lyr = ds.CreateLayer("tiles")
+    lyr.CreateField(ogr.FieldDefn("location"))
+    for field in fields:
+        lyr.CreateField(ogr.FieldDefn(field, ogr.OFTInteger))
+    for i, ((x0, x1), value) in enumerate(zip(spans, values)):
+        f = ogr.Feature(lyr.GetLayerDefn())
+        f["location"] = _fs_tile(
+            str(tmp_vsimem / f"{name}_{i + 1}.tif"), x0, x1, res, value
+        )
+        for field in fields:
+            f[field] = i + 1
+        f.SetGeometry(
+            ogr.CreateGeometryFromWkt(
+                f"POLYGON(({x0} 9,{x0} 49,{x1} 49,{x1} 9,{x0} 9))"
+            )
+        )
+        lyr.CreateFeature(f)
+    if metadata:
+        lyr.SetMetadata(metadata)
+    ds = None
+    return filename
+
+
+def _fs_tier_md(res):
+    """Layer metadata that makes a tile index a GTI dataset on its own."""
+    return {
+        "LOCATION_FIELD": "location",
+        "RESX": str(res),
+        "RESY": str(res),
+        "BAND_COUNT": "1",
+        "DATA_TYPE": "Byte",
+    }
+
+
+def _fs_mosaic(tmp_vsimem, body, base=None, name="mosaic.gti"):
+    """The .gti wrapper over the 1 m base index, with `body` (overviews, filter, sort)."""
+    base = base or _fs_items(tmp_vsimem, "base", 1, (1, 2))
+    filename = str(tmp_vsimem / name)
+    gdal.FileFromMemBuffer(
+        filename,
+        f"""<GDALTileIndexDataset>
+    <IndexDataset>{base}</IndexDataset>
+    <IndexLayer>tiles</IndexLayer>
+    <LocationField>location</LocationField>
+    <BandCount>1</BandCount><DataType>Byte</DataType><ResX>1</ResX><ResY>1</ResY>
+    {body}
+</GDALTileIndexDataset>""",
+    )
+    return filename
+
+
+def _fs_read(ds, factor=4):
+    """(left item, right item) of a read `factor` times coarser than 80 x 40."""
+    w, h = 80 // factor, 40 // factor
+    data = struct.unpack("B" * (w * h), ds.ReadRaster(0, 0, 80, 40, w, h))
+    return data[(h // 2) * w + w // 4], data[(h // 2) * w + (3 * w) // 4]
+
+
+def _fs_open(filename, *options):
+    return gdal.OpenEx(filename, gdal.OF_RASTER, open_options=list(options))
+
+
+@pytest.mark.parametrize("prefix", ["GTI:", ""])
+def test_gti_filter_sort_filter_reaches_dataset_overview(tmp_vsimem, prefix):
+    """A FILTER open option applies to an <Overview><Dataset> that is a tile
+    index, named with the GTI: prefix or as a .gti.gpkg file."""
+    ovr = _fs_items(tmp_vsimem, "ovr", 2, (11, 12), metadata=_fs_tier_md(2))
+    mosaic = _fs_mosaic(
+        tmp_vsimem, f"<Overview><Dataset>{prefix}{ovr}</Dataset></Overview>"
+    )
+    assert _fs_read(_fs_open(mosaic)) == (11, 12)
+    assert _fs_read(_fs_open(mosaic, "FILTER=cat = 2")) == (0, 12)
+    assert _fs_read(_fs_open(mosaic, "filter=cat = 2")) == (0, 12)
+    assert _fs_read(_fs_open(mosaic, "FILTER=cat = 2"), factor=1) == (0, 2)
+
+
+def test_gti_filter_sort_declared_filter_reaches_dataset_overview(tmp_vsimem):
+    """The wrapper's own <Filter> defines the mosaic: the overview must follow it
+    without a copy in its <OpenOptions>."""
+    ovr = _fs_items(tmp_vsimem, "ovr", 2, (11, 12), metadata=_fs_tier_md(2))
+    mosaic = _fs_mosaic(
+        tmp_vsimem,
+        f"<Filter>cat = 2</Filter><Overview><Dataset>GTI:{ovr}</Dataset></Overview>",
+    )
+    assert _fs_read(_fs_open(mosaic)) == (0, 12)
+
+
+def test_gti_filter_sort_sort_reaches_dataset_overview(tmp_vsimem):
+    """SORT_FIELD / SORT_FIELD_ASC decide which of two overlapping items is on
+    top (the one sorted last) in the overview too."""
+    base = _fs_items(tmp_vsimem, "base", 1, (1, 2), spans=_FS_OVERLAP)
+    ovr = _fs_items(
+        tmp_vsimem, "ovr", 2, (11, 12), spans=_FS_OVERLAP, metadata=_fs_tier_md(2)
+    )
+    mosaic = _fs_mosaic(
+        tmp_vsimem,
+        f"<SortField>zorder</SortField><Overview><Dataset>GTI:{ovr}</Dataset></Overview>",
+        base=base,
+    )
+    assert _fs_read(_fs_open(mosaic)) == (12, 12)
+    assert _fs_read(_fs_open(mosaic, "SORT_FIELD_ASC=NO")) == (11, 11)
+    assert _fs_read(_fs_open(mosaic, "SORT_FIELD_ASC=NO"), factor=1) == (1, 1)
+
+
+def test_gti_filter_sort_overview_own_filter_is_anded(tmp_vsimem):
+    """A FILTER in the <Overview>'s own <OpenOptions> narrows the overview's rows:
+    it neither replaces the mosaic's filter nor is replaced by it."""
+    ovr = _fs_items(tmp_vsimem, "ovr", 2, (11, 12), metadata=_fs_tier_md(2))
+    mosaic = _fs_mosaic(
+        tmp_vsimem,
+        f"""<Overview><Dataset>GTI:{ovr}</Dataset>
+        <OpenOptions><OOI key="FILTER">cat = 1</OOI></OpenOptions></Overview>""",
+    )
+    assert _fs_read(_fs_open(mosaic)) == (11, 0)
+    assert _fs_read(_fs_open(mosaic, "FILTER=cat = 2")) == (0, 0)
+
+
+def test_gti_filter_sort_long_filter(tmp_vsimem):
+    """A filter far longer than CPLSPrintf's buffer (a lockRasterIds of
+    thousands of ids) reaches the overview intact, also when ANDed."""
+    ovr = _fs_items(tmp_vsimem, "ovr", 2, (11, 12), metadata=_fs_tier_md(2))
+    mosaic = _fs_mosaic(
+        tmp_vsimem,
+        f"""<Overview><Dataset>GTI:{ovr}</Dataset>
+        <OpenOptions><OOI key="FILTER">cat &gt;= 1</OOI></OpenOptions></Overview>""",
+    )
+    long_filter = "cat IN (" + ", ".join(["2"] * 5000) + ")"  # ~15 000 chars
+    assert _fs_read(_fs_open(mosaic, "FILTER=" + long_filter)) == (0, 12)
+
+
+def test_gti_filter_sort_implicit_level_own_filter_leaves_parent(tmp_vsimem):
+    """An implicit level with a FILTER of its own must not share the parent's
+    layer object: setting its filter there would change the parent's."""
+    mosaic = _fs_mosaic(
+        tmp_vsimem,
+        """<Overview><Factor>2</Factor>
+        <OpenOptions><OOI key="FILTER">cat = 1</OOI></OpenOptions></Overview>""",
+    )
+    ds = _fs_open(mosaic)
+    assert ds.GetRasterBand(1).GetOverviewCount() == 1
+    assert _fs_read(ds) == (1, 0)  # the level: its own filter
+    assert _fs_read(ds, factor=1) == (1, 2)  # the parent: unfiltered
+    ovr_ds = ds.GetRasterBand(1).GetOverview(0).GetDataset()
+    assert _dbg(ovr_ds, "INDEX_DATASET_SHARED_WITH_PARENT") == "NO"
+    # with a filter on the parent, the level's own filter is ANDed with it
+    ds = _fs_open(mosaic, "FILTER=cat = 2")
+    assert _fs_read(ds) == (0, 0)
+    assert _fs_read(ds, factor=1) == (0, 2)
+
+
+def test_gti_filter_sort_dataset_overview_gets_mosaic_extent(tmp_vsimem):
+    """An overview whose own rows reach further than the mosaic is given
+    the mosaic's extent. GeoJSON indexes, whose extent honours the filter: with
+    FILTER=cat = 2 the mosaic is [42, 82], the overview's second tile reaches 86."""
+    base = _fs_items(tmp_vsimem, "base", 1, (1, 2), driver="GeoJSON")
+    ovr = _fs_items(
+        tmp_vsimem, "ovr", 2, (11, 12), spans=((2, 42), (42, 86)), driver="GeoJSON"
+    )
+    mosaic = _fs_mosaic(
+        tmp_vsimem,
+        f"""<Overview><Dataset>GTI:{ovr}</Dataset><OpenOptions>
+        <OOI key="RESX">2</OOI><OOI key="RESY">2</OOI>
+        <OOI key="BAND_COUNT">1</OOI><OOI key="DATA_TYPE">Byte</OOI>
+        </OpenOptions></Overview>""",
+        base=base,
+    )
+    with gdal.quiet_errors():  # "Could get layer extent, but using a slower method"
+        ds = _fs_open(mosaic, "FILTER=cat = 2")
+        assert (ds.RasterXSize, ds.GetGeoTransform()[0]) == (40, 42)
+        ovr_band = ds.GetRasterBand(1).GetOverview(0)
+        assert ovr_band.XSize == 20
+        assert ovr_band.GetDataset().GetGeoTransform()[0] == 42

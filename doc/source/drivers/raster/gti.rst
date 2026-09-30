@@ -663,6 +663,23 @@ The order of declaration may matter. Overview levels directly or indirectly
 specified by later XML or metadata items are only added if their size is smaller
 than the previously added overview.
 
+Overviews, FILTER and SORT_FIELD
+++++++++++++++++++++++++++++++++
+
+An overview level is the same virtual mosaic at a lower resolution. The tiles
+selected by ``FILTER`` and the order given by ``SORT_FIELD`` and
+``SORT_FIELD_ASC``, whether they come from open options, the XML file or layer
+metadata, therefore apply to overview levels too:
+
+- An overview level that is the tile index itself (``<Factor>`` and/or
+  ``<Layer>`` without ``<Dataset>``), and a ``<Dataset>`` that is itself a GTI
+  dataset, are opened with the ``FILTER`` and sort order of the dataset. A
+  ``FILTER`` in the level's own ``<OpenOptions>`` is combined with the dataset's as
+  ``(dataset filter) AND (level filter)``; the dataset's sort order replaces the
+  level's own.
+- A ``<Dataset>`` that is a GTI dataset is also given the extent of the dataset
+  (``MINX``, ``MINY``, ``MAXX``, ``MAXY``), unless its ``<OpenOptions>`` set it.
+
 .. _raster.gti.overview.xml:
 
 Overviews in XML
