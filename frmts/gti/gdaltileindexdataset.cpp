@@ -254,6 +254,7 @@ class GDALTileIndexDataset final : public GDALPamDataset
                       bool bWarn);
     bool HasMosaicExtent(const GDALDataset *poOvrDS,
                          std::string &osExplanation) const;
+    bool CanReadIndex(std::string &osError);
 
     /** Directory where the main (.xml / .gti.gpkg) file is located.
      * Used for relative filenames resolution.
@@ -364,7 +365,7 @@ class GDALTileIndexDataset final : public GDALPamDataset
     bool m_bSortFieldAsc = true;
 
     //! Effective FILTER (open option, XML or layer metadata), empty if none.
-    //! Overviews indexing the same items are opened with it.
+    //! Overviews that are tile indexes are opened with it.
     std::string m_osFilter{};
 
     //! Name of the effective SORT_FIELD, empty if none.
@@ -3311,9 +3312,9 @@ static bool IsTileIndexOverviewDataset(const std::string &osDSName)
 /*                      SetOverviewFilterAndSort()                      */
 /************************************************************************/
 
-//! Set the FILTER and sort order an overview indexing the same items must
+//! Set the FILTER and sort order an overview that is a tile index must
 //! follow: our filter AND the overview's own, and our sort order. An overview
-//! is the same mosaic at a lower resolution, so it selects and stacks items
+//! is the same mosaic at a lower resolution, so it selects and stacks tiles
 //! as we do.
 void GDALTileIndexDataset::SetOverviewFilterAndSort(
     CPLStringList &aosOptions) const
@@ -3470,6 +3471,31 @@ bool GDALTileIndexDataset::HasMosaicExtent(const GDALDataset *poOvrDS,
 }
 
 /************************************************************************/
+/*                            CanReadIndex()                            */
+/************************************************************************/
+
+//! Whether the index can be read with our filter. GeoPackage, PostgreSQL,
+//! ... accept an attribute filter on a field they lack, and only fail when
+//! the features are read.
+bool GDALTileIndexDataset::CanReadIndex(std::string &osError)
+{
+    if (m_osFilter.empty())
+        return true;
+    bool bOK;
+    {
+        CPLErrorStateBackuper oBackuper(CPLQuietErrorHandler);
+        CPLErrorReset();
+        m_poLayer->ResetReading();
+        std::unique_ptr<OGRFeature> poFeature(m_poLayer->GetNextFeature());
+        bOK = CPLGetLastErrorType() != CE_Failure;
+        if (!bOK)
+            osError = CPLGetLastErrorMsg();
+    }
+    m_poLayer->ResetReading();
+    return bOK;
+}
+
+/************************************************************************/
 /*                           LoadOverviews()                            */
 /************************************************************************/
 
@@ -3495,7 +3521,7 @@ void GDALTileIndexDataset::LoadOverviews()
                 // options (MASK_BAND, ...). Options defining the resolution
                 // are replaced by @FACTOR; FILTER, SORT_FIELD and
                 // SORT_FIELD_ASC are set below, as for every overview
-                // indexing the same items.
+                // that is a tile index.
                 for (const auto &[pszKey, pszValue] : cpl::IterateNameValue(
                          static_cast<CSLConstList>(GetOpenOptions())))
                 {
@@ -3544,26 +3570,28 @@ void GDALTileIndexDataset::LoadOverviews()
             }
 
             // An implicit level is this very index; a <Dataset> that is a
-            // tile index holds the same items at a coarser resolution. Both
+            // tile index is the same mosaic at a coarser resolution. Both
             // show the mosaic with our filter and sort order, over our extent.
             const bool bImplicit = osResolvedDSName.empty();
+            // Declared materialized and not usable now: no need to look at it.
+            const bool bSkipUnseen =
+                oMaterialized.value_or(false) && !m_bDeclaredFilterAndSort;
+            const bool bTileIndex =
+                bImplicit ||
+                (!bSkipUnseen && IsTileIndexOverviewDataset(osResolvedDSName));
+            if (!bTileIndex && !bSkipUnseen && oMaterialized.has_value())
+            {
+                CPLError(CE_Warning, CPLE_AppDefined,
+                         "%s=false ignored for %s: a raster that is not "
+                         "a tile index is always materialized",
+                         GTI_XML_OVERVIEW_MATERIALIZED,
+                         osResolvedDSName.c_str());
+            }
             // A <Dataset> that is not a tile index is materialized: its
             // pixels were composited ahead of time, with the declared filter
             // and sort order.
-            bool bMaterialized = oMaterialized.value_or(false);
-            if (!bImplicit && !bMaterialized &&
-                !IsTileIndexOverviewDataset(osResolvedDSName))
-            {
-                if (oMaterialized.has_value())
-                {
-                    CPLError(CE_Warning, CPLE_AppDefined,
-                             "%s=false ignored for %s: a raster that is not "
-                             "a tile index is always materialized",
-                             GTI_XML_OVERVIEW_MATERIALIZED,
-                             osResolvedDSName.c_str());
-                }
-                bMaterialized = true;
-            }
+            const bool bMaterialized =
+                oMaterialized.value_or(false) || !bTileIndex;
             if (bMaterialized && !m_bDeclaredFilterAndSort)
             {
                 SkipOverview(iOvrDesc, osResolvedDSName, "materialized",
@@ -3582,8 +3610,16 @@ void GDALTileIndexDataset::LoadOverviews()
                 continue;
             }
             if (!bMaterialized)
-            {
                 SetOverviewFilterAndSort(aosNewOpenOptions);
+            if (bImplicit && !aosNewOpenOptions.FetchNameValue("FILTER"))
+            {
+                // The level reads our XML again: without a FILTER it would
+                // apply the declared <Filter> even where an empty FILTER open
+                // option cleared ours.
+                aosNewOpenOptions.SetNameValue("FILTER", "");
+            }
+            if (bTileIndex)
+            {
                 SetOverviewExtent(aosNewOpenOptions);
                 aosNewOpenOptions.SetNameValue(
                     "@DECLARED_FILTER_AND_SORT",
@@ -3611,25 +3647,55 @@ void GDALTileIndexDataset::LoadOverviews()
             // apply it (a missing field, ...) is left out with a warning: the
             // mosaic is still served, by the finer levels. As declared, a
             // failure stays an error: the index itself is misconfigured.
-            std::optional<CPLTurnFailureIntoWarningBackuper> oFailureAsWarning;
-            if (!bImplicit && !bMaterialized && !m_bDeclaredFilterAndSort)
-                oFailureAsWarning.emplace();
-
-            std::unique_ptr<GDALDataset, GDALDatasetUniquePtrReleaser> poOvrDS(
-                GDALDataset::Open(!osResolvedDSName.empty()
-                                      ? osResolvedDSName.c_str()
-                                      : GetDescription(),
-                                  GDAL_OF_RASTER | GDAL_OF_VERBOSE_ERROR,
-                                  nullptr, aosNewOpenOptions.List(), nullptr));
+            const bool bFailureAsWarning =
+                !bImplicit && !bMaterialized && !m_bDeclaredFilterAndSort;
+            std::unique_ptr<GDALDataset, GDALDatasetUniquePtrReleaser> poOvrDS;
+            {
+                // Around the open only: later failures (the overview's own
+                // levels, ...) are not caused by our filter.
+                std::optional<CPLTurnFailureIntoWarningBackuper>
+                    oFailureAsWarning;
+                if (bFailureAsWarning)
+                    oFailureAsWarning.emplace();
+                poOvrDS.reset(GDALDataset::Open(
+                    !osResolvedDSName.empty() ? osResolvedDSName.c_str()
+                                              : GetDescription(),
+                    GDAL_OF_RASTER | GDAL_OF_VERBOSE_ERROR, nullptr,
+                    aosNewOpenOptions.List(), nullptr));
+            }
             // Not consumed if the open failed before reaching our Open()
             g_poParentForImplicitOverview = nullptr;
-            if (!poOvrDS && oFailureAsWarning)
+            if (!poOvrDS && bFailureAsWarning)
             {
                 SkipOverview(iOvrDesc, osResolvedDSName, "open-failed",
                              "it cannot be opened with the requested filter "
                              "or sort order",
                              true);
                 continue;
+            }
+            // GeoPackage, PostgreSQL, ... accept a filter on a field they
+            // lack and only fail when reading: find out now rather than serve
+            // a blank level.
+            if (poOvrDS && !bImplicit && !bMaterialized && !m_osFilter.empty())
+            {
+                auto poOvrGTI =
+                    dynamic_cast<GDALTileIndexDataset *>(poOvrDS.get());
+                std::string osError;
+                if (poOvrGTI && !poOvrGTI->CanReadIndex(osError))
+                {
+                    const std::string osExplanation =
+                        "it cannot apply the filter: " + osError;
+                    if (!bFailureAsWarning)
+                    {
+                        CPLError(CE_Failure, CPLE_AppDefined,
+                                 "Not using overview %d (%s): %s", iOvrDesc,
+                                 osResolvedDSName.c_str(),
+                                 osExplanation.c_str());
+                    }
+                    SkipOverview(iOvrDesc, osResolvedDSName, "open-failed",
+                                 osExplanation.c_str(), bFailureAsWarning);
+                    continue;
+                }
             }
 
             // Make it possible to use the Factor option on a GeoTIFF for

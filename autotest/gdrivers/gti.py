@@ -4627,7 +4627,7 @@ def test_gti_implicit_overview_shares_sql_result_layer(tmp_vsimem):
 ###############################################################################
 # Overviews follow FILTER, SORT_FIELD and SORT_FIELD_ASC.
 #
-# Two items with cat = zorder = 1 and 2, side by side on [2, 42] and [42, 82]
+# Two tiles with cat = zorder = 1 and 2, side by side on [2, 42] and [42, 82]
 # x [9, 49] (or both on [2, 82] with _FS_OVERLAP). The base index holds them at
 # 1 m with tile values 1 and 2; a coarser tile index holds them at 2 m with
 # values 11 and 12 (4 m: 21 and 22), so a read tells which level answered.
@@ -4657,7 +4657,7 @@ def _fs_items(
     fields=("cat", "zorder"),
     metadata=None,
 ):
-    """A tile index of the two items at `res`, with tile values `values`."""
+    """A tile index of the two tiles at `res`, with tile values `values`."""
     ext = {"GPKG": ".gti.gpkg", "GeoJSON": ".geojson"}[driver]
     filename = str(tmp_vsimem / (name + ext))
     ds = ogr.GetDriverByName(driver).CreateDataSource(filename)
@@ -4713,7 +4713,7 @@ def _fs_mosaic(tmp_vsimem, body, base=None, name="mosaic.gti"):
 
 
 def _fs_read(ds, factor=4):
-    """(left item, right item) of a read `factor` times coarser than 80 x 40."""
+    """(left tile, right tile) of a read `factor` times coarser than 80 x 40."""
     w, h = 80 // factor, 40 // factor
     data = struct.unpack("B" * (w * h), ds.ReadRaster(0, 0, 80, 40, w, h))
     return data[(h // 2) * w + w // 4], data[(h // 2) * w + (3 * w) // 4]
@@ -4749,7 +4749,7 @@ def test_gti_filter_sort_declared_filter_reaches_dataset_overview(tmp_vsimem):
 
 
 def test_gti_filter_sort_sort_reaches_dataset_overview(tmp_vsimem):
-    """SORT_FIELD / SORT_FIELD_ASC decide which of two overlapping items is on
+    """SORT_FIELD / SORT_FIELD_ASC decide which of two overlapping tiles is on
     top (the one sorted last) in the overview too."""
     base = _fs_items(tmp_vsimem, "base", 1, (1, 2), spans=_FS_OVERLAP)
     ovr = _fs_items(
@@ -4779,8 +4779,9 @@ def test_gti_filter_sort_overview_own_filter_is_anded(tmp_vsimem):
 
 
 def test_gti_filter_sort_long_filter(tmp_vsimem):
-    """A filter far longer than CPLSPrintf's buffer (a lockRasterIds of
-    thousands of ids) reaches the overview intact, also when ANDed."""
+    """A filter far longer than CPLSPrintf's buffer (an FID or attribute
+    list of thousands of values) reaches the overview intact, also when
+    ANDed."""
     ovr = _fs_items(tmp_vsimem, "ovr", 2, (11, 12), metadata=_fs_tier_md(2))
     mosaic = _fs_mosaic(
         tmp_vsimem,
@@ -4788,7 +4789,7 @@ def test_gti_filter_sort_long_filter(tmp_vsimem):
         <OpenOptions><OOI key="FILTER">cat &gt;= 1</OOI></OpenOptions></Overview>""",
     )
     # ~13 000 chars, above CPLSPrintf's 8000; OGR SQL still parses it (a list
-    # of several thousand items exhausts its parser, making it index-local)
+    # of several thousand values exhausts its parser, making it index-local)
     long_filter = "cat IN (2, " + ", ".join(str(1000000 + i) for i in range(1500)) + ")"
     assert _fs_read(_fs_open(mosaic, "FILTER=" + long_filter)) == (0, 12)
 
@@ -4876,7 +4877,7 @@ def test_gti_filter_sort_non_gti_overview_is_materialized(tmp_vsimem):
     assert ds.GetRasterBand(1).GetOverviewCount() == 0  # not reconsidered
     assert _dbg(ds, "OVERVIEWS_SKIPPED") == "0:materialized"
     assert _fs_read(ds) == (0, 2)
-    # <Materialized>false</Materialized> cannot make it an item overview
+    # <Materialized>false</Materialized> cannot make it a tile index
     mosaic = _fs_mosaic(
         tmp_vsimem,
         f"<Overview><Dataset>{tif}</Dataset><Materialized>false</Materialized></Overview>",
@@ -4890,9 +4891,9 @@ def test_gti_filter_sort_non_gti_overview_is_materialized(tmp_vsimem):
 
 
 def test_gti_filter_sort_fid_or_location_filter_stays_in_index(tmp_vsimem):
-    """A FILTER on the FID (a lockRasterIds) or on the location field only
+    """A FILTER on the FID or on the location field only
     means something in this index: <Dataset> overviews are not used, implicit
-    levels are. A filter on an item attribute reaches the overview."""
+    levels are. A filter on another field reaches the overview."""
     ovr = _fs_items(tmp_vsimem, "ovr", 4, (21, 22), metadata=_fs_tier_md(4))
     mosaic = _fs_mosaic(
         tmp_vsimem,
@@ -5005,3 +5006,90 @@ def test_gti_overview_dataset_extent_is_checked(tmp_vsimem, shift, used):
         assert "is not the mosaic's" in msg
         assert _dbg(ds, "OVERVIEWS_SKIPPED") == "0:extent"
         assert _fs_read(ds) == (1, 2)
+
+
+def test_gti_filter_sort_overview_lacking_filter_field_is_skipped(tmp_vsimem):
+    """A tile-index overview lacking the filtered field is left out: with a
+    requested FILTER with a warning, with the declared <Filter> with an error.
+    GeoPackage (like PostgreSQL) only reports an unknown column when reading,
+    which would otherwise leave the level blank."""
+    ovr = _fs_items(
+        tmp_vsimem, "ovr", 2, (11, 12), fields=("zorder",), metadata=_fs_tier_md(2)
+    )
+    mosaic = _fs_mosaic(tmp_vsimem, f"<Overview><Dataset>GTI:{ovr}</Dataset></Overview>")
+    ds = _fs_open(mosaic, "FILTER=cat = 2")
+    with gdal.quiet_errors():
+        gdal.ErrorReset()
+        assert ds.GetRasterBand(1).GetOverviewCount() == 0
+        assert gdal.GetLastErrorType() == gdal.CE_Warning
+    assert _dbg(ds, "OVERVIEWS_SKIPPED") == "0:open-failed"
+    assert _fs_read(ds) == (0, 2)
+    mosaic = _fs_mosaic(
+        tmp_vsimem,
+        f"<Filter>cat = 2</Filter><Overview><Dataset>GTI:{ovr}</Dataset></Overview>",
+        name="mosaic2.gti",
+    )
+    ds = _fs_open(mosaic)
+    with gdal.quiet_errors(), pytest.raises(Exception, match="cannot apply the filter"):
+        ds.GetRasterBand(1).GetOverviewCount()
+
+
+def test_gti_filter_sort_cleared_filter_reaches_implicit_level(tmp_vsimem):
+    """FILTER= clears the declared <Filter>. An implicit level, which reads the
+    same XML, is cleared too, and does not set the declared filter on the
+    layer it shares with the dataset."""
+    mosaic = _fs_mosaic(
+        tmp_vsimem, "<Filter>cat = 2</Filter><Overview><Factor>2</Factor></Overview>"
+    )
+    ds = _fs_open(mosaic, "FILTER=")
+    assert _fs_read(ds, factor=1) == (1, 2)
+    assert _fs_read(ds) == (1, 2)  # the level
+    # another window at full resolution, so that the tiles are queried again
+    left = struct.unpack("B" * 1600, ds.ReadRaster(0, 0, 40, 40))
+    assert set(left) == {1}
+
+
+def test_gti_filter_sort_materialized_passes_xml_validation(tmp_vsimem):
+    """<Materialized> is part of the GTI XML schema."""
+    ovr = _fs_items(tmp_vsimem, "ovr", 2, (11, 12), metadata=_fs_tier_md(2))
+    mosaic = _fs_mosaic(
+        tmp_vsimem,
+        f"<Overview><Dataset>GTI:{ovr}</Dataset>"
+        "<Materialized>true</Materialized></Overview>",
+    )
+    messages = []
+    gdal.PushErrorHandler(lambda cls, no, msg: messages.append(msg))
+    try:
+        _fs_open(mosaic)
+    finally:
+        gdal.PopErrorHandler()
+    assert not [m for m in messages if "Materialized" in m], messages
+
+
+def test_gti_filter_sort_materialized_tile_index_gets_extent_and_state(tmp_vsimem):
+    """A materialized tile-index overview is still given the mosaic's extent,
+    and told that the caller kept the declared filter and sort order: rows
+    reaching beyond the mosaic must not get it rejected, and a FILTER of its
+    own must not make it drop its own materialized overview."""
+    tif = _fs_tile(str(tmp_vsimem / "composite.tif"), 2, 82, 4, 99)
+    ovr = _fs_items(
+        tmp_vsimem,
+        "ovr",
+        2,
+        (11, 12),
+        spans=((2, 42), (42, 86)),
+        metadata=_fs_tier_md(2) | {"OVERVIEW_0_DATASET": tif},
+    )
+    mosaic = _fs_mosaic(
+        tmp_vsimem,
+        f"""<Overview><Dataset>GTI:{ovr}</Dataset>
+        <OpenOptions><OOI key="FILTER">cat &gt;= 1</OOI></OpenOptions>
+        <Materialized>true</Materialized></Overview>""",
+    )
+    ds = _fs_open(mosaic)
+    with gdal.quiet_errors():
+        gdal.ErrorReset()
+        assert ds.GetRasterBand(1).GetOverviewCount() == 2
+    assert _dbg(ds, "OVERVIEWS_SKIPPED") == ""
+    assert _fs_read(ds, factor=8) == (99, 99)
+

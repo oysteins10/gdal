@@ -97,6 +97,7 @@
                 <xs:element name="Dataset" type="xs:string"/>
                 <xs:element name="Layer" type="xs:string"/>
                 <xs:element name="Factor" type="xs:double"/>
+                <xs:element name="Materialized" type="OGRBooleanType"/>
                 <xs:element name="OpenOptions" type="OpenOptionsType"/>
             </xs:choice>
         </xs:sequence>
