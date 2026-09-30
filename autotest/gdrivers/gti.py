@@ -4983,3 +4983,25 @@ def test_gti_filter_sort_internal_option_stays_internal(tmp_vsimem):
         assert ds.GetRasterBand(1).GetOverviewCount() == 2
         assert gdal.GetLastErrorMsg() == ""
     assert _fs_read(ds, factor=8) == (11, 12)
+
+
+@pytest.mark.parametrize("shift,used", [(0, True), (1, True), (4, False)])
+def test_gti_overview_dataset_extent_is_checked(tmp_vsimem, shift, used):
+    """A <Dataset> overview whose extent is off by more than one of its pixels
+    (2 m here) is not used: GDAL maps the mosaic onto an overview by size ratio
+    and would read imagery from the wrong place."""
+    tif = _fs_tile(str(tmp_vsimem / "composite.tif"), 2 + shift, 82 + shift, 2, 99)
+    mosaic = _fs_mosaic(tmp_vsimem, f"<Overview><Dataset>{tif}</Dataset></Overview>")
+    ds = _fs_open(mosaic)
+    with gdal.quiet_errors():
+        gdal.ErrorReset()
+        count = ds.GetRasterBand(1).GetOverviewCount()
+        msg = gdal.GetLastErrorMsg()
+    if used:
+        assert count == 1
+        assert _fs_read(ds) == (99, 99)
+    else:
+        assert count == 0
+        assert "is not the mosaic's" in msg
+        assert _dbg(ds, "OVERVIEWS_SKIPPED") == "0:extent"
+        assert _fs_read(ds) == (1, 2)

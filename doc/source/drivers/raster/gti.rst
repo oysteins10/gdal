@@ -287,8 +287,10 @@ PostGIS, ...), the following layer metadata items may be set:
   See :ref:`raster_data_model_interleave_mode` for more details.
 
 All overviews *must* have exactly the same extent as the full resolution
-virtual mosaic. The GTI driver does not check that, and if that condition is
-not met, subsampled pixel request will lead to incorrect result.
+virtual mosaic. An overview given as a GTI dataset gets that extent (see
+:ref:`raster.gti.overview.filter_sort`); any other ``<Dataset>`` / ``OVERVIEW_<idx>_DATASET``
+whose extent differs from the mosaic's by more than one of its pixels is not
+used, with a warning.
 
 They also must be listed by decreasing size with increasing overview index.
 

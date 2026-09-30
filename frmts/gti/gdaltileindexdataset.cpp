@@ -252,6 +252,8 @@ class GDALTileIndexDataset final : public GDALPamDataset
     void SkipOverview(int iOvr, const std::string &osName,
                       const char *pszReason, const char *pszExplanation,
                       bool bWarn);
+    bool HasMosaicExtent(const GDALDataset *poOvrDS,
+                         std::string &osExplanation) const;
 
     /** Directory where the main (.xml / .gti.gpkg) file is located.
      * Used for relative filenames resolution.
@@ -3420,6 +3422,54 @@ void GDALTileIndexDataset::SkipOverview(int iOvr, const std::string &osName,
 }
 
 /************************************************************************/
+/*                          HasMosaicExtent()                           */
+/************************************************************************/
+
+//! Whether an overview covers our extent, within one of its pixels. GDAL maps
+//! our pixels onto an overview by the ratio of the sizes alone, so any other
+//! extent reads the wrong place, the further from the origin the more.
+bool GDALTileIndexDataset::HasMosaicExtent(const GDALDataset *poOvrDS,
+                                           std::string &osExplanation) const
+{
+    GDALGeoTransform ovrGT;
+    if (poOvrDS->GetGeoTransform(ovrGT) != CE_None)
+    {
+        osExplanation = "it has no geotransform";
+        return false;
+    }
+    if (ovrGT.xrot != 0 || ovrGT.yrot != 0)
+    {
+        osExplanation = "it is rotated";
+        return false;
+    }
+    const double dfOvrMinX = ovrGT.xorig;
+    const double dfOvrMaxX =
+        ovrGT.xorig + ovrGT.xscale * poOvrDS->GetRasterXSize();
+    const double dfOvrMaxY = ovrGT.yorig;
+    const double dfOvrMinY =
+        ovrGT.yorig + ovrGT.yscale * poOvrDS->GetRasterYSize();
+    const double dfMinX = m_gt.xorig;
+    const double dfMaxX = m_gt.xorig + m_gt.xscale * nRasterXSize;
+    const double dfMaxY = m_gt.yorig;
+    const double dfMinY = m_gt.yorig + m_gt.yscale * nRasterYSize;
+    const double dfTolX = std::fabs(ovrGT.xscale);
+    const double dfTolY = std::fabs(ovrGT.yscale);
+    if (std::fabs(dfOvrMinX - dfMinX) > dfTolX ||
+        std::fabs(dfOvrMaxX - dfMaxX) > dfTolX ||
+        std::fabs(dfOvrMinY - dfMinY) > dfTolY ||
+        std::fabs(dfOvrMaxY - dfMaxY) > dfTolY)
+    {
+        osExplanation = CPLSPrintf(
+            "its extent (%.17g, %.17g, %.17g, %.17g) is not the mosaic's "
+            "(%.17g, %.17g, %.17g, %.17g)",
+            dfOvrMinX, dfOvrMinY, dfOvrMaxX, dfOvrMaxY, dfMinX, dfMinY, dfMaxX,
+            dfMaxY);
+        return false;
+    }
+    return true;
+}
+
+/************************************************************************/
 /*                           LoadOverviews()                            */
 /************************************************************************/
 
@@ -3628,6 +3678,18 @@ void GDALTileIndexDataset::LoadOverviews()
 
                         poOvrDS.reset(poNewOvrDS);
                     }
+                }
+            }
+
+            if (poOvrDS && !bImplicit)
+            {
+                std::string osExplanation;
+                if (!HasMosaicExtent(poOvrDS.get(), osExplanation))
+                {
+                    SkipOverview(iOvrDesc, osResolvedDSName, "extent",
+                                 osExplanation.c_str(),
+                                 m_bDeclaredFilterAndSort);
+                    continue;
                 }
             }
 
