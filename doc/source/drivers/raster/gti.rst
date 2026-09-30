@@ -275,6 +275,8 @@ PostGIS, ...), the following layer metadata items may be set:
 
 * ``OVERVIEW_<idx>_FACTOR=<int>``. See  :ref:`raster.gti.overview.mdi`
 
+* ``OVERVIEW_<idx>_MATERIALIZED=YES/NO``. See :ref:`raster.gti.overview.mdi`
+
 * ``INTERLEAVE=<val>`` (starting with GDAL 3.13) where ``<val>`` can be
   ``PIXEL`` or ``BAND`` specifies how pixels belonging to multiple bands are
   grouped together. This setting affects performance, both how external code
@@ -663,6 +665,8 @@ The order of declaration may matter. Overview levels directly or indirectly
 specified by later XML or metadata items are only added if their size is smaller
 than the previously added overview.
 
+.. _raster.gti.overview.filter_sort:
+
 Overviews, FILTER and SORT_FIELD
 ++++++++++++++++++++++++++++++++
 
@@ -679,6 +683,23 @@ metadata, therefore apply to overview levels too:
   level's own.
 - A ``<Dataset>`` that is a GTI dataset is also given the extent of the dataset
   (``MINX``, ``MINY``, ``MAXX``, ``MAXY``), unless its ``<OpenOptions>`` set it.
+- A ``<Dataset>`` that is not a GTI dataset (a GeoTIFF, ...), or a GTI dataset
+  declared with ``<Materialized>true</Materialized>`` (layer metadata
+  ``OVERVIEW_<idx>_MATERIALIZED=YES``), is *materialized*: its pixels were
+  composited ahead of time, with the filter and sort order the dataset
+  declares. It is only used when the dataset is opened with those, that is when
+  no open option changes ``FILTER``, ``SORT_FIELD`` or ``SORT_FIELD_ASC``.
+- A ``FILTER`` that uses the FID or the location field, whose values differ from
+  one tile index to another, or that the OGR SQL parser cannot analyze, is not
+  applied to ``<Dataset>`` overviews: they are not used, and downsampled requests
+  are served by the tile index itself and its implicit levels.
+- When the dataset is opened with a filter or sort order other than the declared ones, a
+  ``<Dataset>`` GTI overview that cannot be opened with it (for example because
+  it lacks the sort field) is not used, with a warning.
+
+The ``__DEBUG__`` metadata item ``OVERVIEWS_SKIPPED`` lists the overview levels
+not used, as ``<index>:<reason>``, reasons ``materialized``, ``index-local``,
+``open-failed`` and ``extent``.
 
 .. _raster.gti.overview.xml:
 
@@ -693,6 +714,7 @@ The general syntax for each overview level is:
             <Dataset>other.gti.gpkg</Dataset>
             <Layer>other_layer</Layer>
             <Factor>numeric_value_larger_than_one>
+            <Materialized>true|false</Materialized>
             <OpenOptions>
                 <OOI key="key">value</OOI>
             </OpenOptions>
@@ -818,6 +840,12 @@ an integer index (starting at 0 since GDAL 3.9.2, starting at 1 in previous vers
   (it is recommended, but not required, that those tiles do have a corresponding overview).
   ``OVERVIEW_<idx>_DATASET`` and/or ``OVERVIEW_<idx>_LAYER`` may also be
   specified to point to another tile index.
+
+* ``OVERVIEW_<idx>_MATERIALIZED=YES/NO``
+
+  Only allowed with ``OVERVIEW_<idx>_DATASET``. Declares that dataset, a GTI
+  dataset, as materialized: see :ref:`raster.gti.overview.filter_sort`. A dataset that
+  is not a GTI dataset is always materialized.
 
 .. example::
 

@@ -4787,7 +4787,9 @@ def test_gti_filter_sort_long_filter(tmp_vsimem):
         f"""<Overview><Dataset>GTI:{ovr}</Dataset>
         <OpenOptions><OOI key="FILTER">cat &gt;= 1</OOI></OpenOptions></Overview>""",
     )
-    long_filter = "cat IN (" + ", ".join(["2"] * 5000) + ")"  # ~15 000 chars
+    # ~13 000 chars, above CPLSPrintf's 8000; OGR SQL still parses it (a list
+    # of several thousand items exhausts its parser, making it index-local)
+    long_filter = "cat IN (2, " + ", ".join(str(1000000 + i) for i in range(1500)) + ")"
     assert _fs_read(_fs_open(mosaic, "FILTER=" + long_filter)) == (0, 12)
 
 
@@ -4833,3 +4835,151 @@ def test_gti_filter_sort_dataset_overview_gets_mosaic_extent(tmp_vsimem):
         ovr_band = ds.GetRasterBand(1).GetOverview(0)
         assert ovr_band.XSize == 20
         assert ovr_band.GetDataset().GetGeoTransform()[0] == 42
+
+
+@pytest.mark.parametrize("form", ["xml", "metadata"])
+def test_gti_filter_sort_materialized_overview(tmp_vsimem, form):
+    """An overview declared materialized is only used as declared: under a
+    FILTER the read comes from the base index."""
+    ovr = _fs_items(tmp_vsimem, "ovr", 2, (11, 12), metadata=_fs_tier_md(2))
+    if form == "xml":
+        mosaic = _fs_mosaic(
+            tmp_vsimem,
+            f"<Overview><Dataset>GTI:{ovr}</Dataset>"
+            "<Materialized>true</Materialized></Overview>",
+        )
+    else:
+        mosaic = _fs_items(
+            tmp_vsimem,
+            "base",
+            1,
+            (1, 2),
+            metadata=_fs_tier_md(1)
+            | {"OVERVIEW_0_DATASET": f"GTI:{ovr}", "OVERVIEW_0_MATERIALIZED": "YES"},
+        )
+    assert _fs_read(_fs_open(mosaic)) == (11, 12)
+    ds = _fs_open(mosaic, "FILTER=cat = 2")
+    assert _fs_read(ds) == (0, 2)
+    assert _dbg(ds, "OVERVIEWS_SKIPPED") == "0:materialized"
+    # SORT_FIELD_ASC without SORT_FIELD leaves the mosaic as declared
+    assert _fs_read(_fs_open(mosaic, "SORT_FIELD_ASC=NO")) == (11, 12)
+
+
+def test_gti_filter_sort_non_gti_overview_is_materialized(tmp_vsimem):
+    """A raster that is not a tile index is materialized: used under the
+    declared filter and sort order, not under a FILTER."""
+    tif = _fs_tile(str(tmp_vsimem / "composite.tif"), 2, 82, 2, 99)
+    mosaic = _fs_mosaic(tmp_vsimem, f"<Overview><Dataset>{tif}</Dataset></Overview>")
+    assert _fs_read(_fs_open(mosaic)) == (99, 99)
+    ds = _fs_open(mosaic, "FILTER=cat = 2")
+    assert ds.GetRasterBand(1).GetOverviewCount() == 0
+    assert ds.GetRasterBand(1).GetOverviewCount() == 0  # not reconsidered
+    assert _dbg(ds, "OVERVIEWS_SKIPPED") == "0:materialized"
+    assert _fs_read(ds) == (0, 2)
+    # <Materialized>false</Materialized> cannot make it an item overview
+    mosaic = _fs_mosaic(
+        tmp_vsimem,
+        f"<Overview><Dataset>{tif}</Dataset><Materialized>false</Materialized></Overview>",
+        name="mosaic2.gti",
+    )
+    ds = _fs_open(mosaic, "FILTER=cat = 2")
+    with gdal.quiet_errors():
+        gdal.ErrorReset()
+        assert ds.GetRasterBand(1).GetOverviewCount() == 0
+        assert "always materialized" in gdal.GetLastErrorMsg()
+
+
+def test_gti_filter_sort_fid_or_location_filter_stays_in_index(tmp_vsimem):
+    """A FILTER on the FID (a lockRasterIds) or on the location field only
+    means something in this index: <Dataset> overviews are not used, implicit
+    levels are. A filter on an item attribute reaches the overview."""
+    ovr = _fs_items(tmp_vsimem, "ovr", 4, (21, 22), metadata=_fs_tier_md(4))
+    mosaic = _fs_mosaic(
+        tmp_vsimem,
+        "<Overview><Factor>2</Factor></Overview>"
+        f"<Overview><Dataset>GTI:{ovr}</Dataset></Overview>",
+    )
+    assert _fs_read(_fs_open(mosaic)) == (21, 22)  # factor 4: the <Dataset> overview
+    for option in ("FILTER=fid IN (2)", "FILTER=location LIKE '%base_2%'"):
+        ds = _fs_open(mosaic, option)
+        assert _fs_read(ds) == (0, 2), option  # the factor 2 level
+        assert _dbg(ds, "OVERVIEWS_SKIPPED") == "1:index-local", option
+        assert ds.GetRasterBand(1).GetOverviewCount() == 1, option
+    assert _fs_read(_fs_open(mosaic, "FILTER=cat = 2")) == (0, 22)
+
+
+def test_gti_filter_sort_unparsable_filter_stays_in_index(tmp_vsimem):
+    """A filter OGR SQL cannot analyze (SQLite's instr()) might reference
+    anything: <Dataset> overviews are not used."""
+    ovr = _fs_items(tmp_vsimem, "ovr", 2, (11, 12), metadata=_fs_tier_md(2))
+    mosaic = _fs_mosaic(tmp_vsimem, f"<Overview><Dataset>GTI:{ovr}</Dataset></Overview>")
+    ds = _fs_open(mosaic, "FILTER=instr(CAST(cat AS TEXT), '2') > 0")
+    assert _fs_read(ds) == (0, 2)
+    assert _dbg(ds, "OVERVIEWS_SKIPPED") == "0:index-local"
+
+
+def test_gti_filter_sort_overview_that_cannot_apply_it_is_skipped(tmp_vsimem):
+    """With a requested sort order, an overview lacking the sort field is left
+    out with a warning, not an error; the dataset reads from the base."""
+    ovr = _fs_items(
+        tmp_vsimem, "ovr", 2, (11, 12), fields=("cat",), metadata=_fs_tier_md(2)
+    )
+    mosaic = _fs_mosaic(tmp_vsimem, f"<Overview><Dataset>GTI:{ovr}</Dataset></Overview>")
+    ds = _fs_open(mosaic, "SORT_FIELD=zorder")
+    with gdal.quiet_errors():
+        gdal.ErrorReset()
+        assert ds.GetRasterBand(1).GetOverviewCount() == 0
+        assert gdal.GetLastErrorType() == gdal.CE_Warning
+    assert _dbg(ds, "OVERVIEWS_SKIPPED") == "0:open-failed"
+    assert _fs_read(ds) == (1, 2)
+
+
+def test_gti_filter_sort_nested_materialized_follows_root(tmp_vsimem):
+    """A materialized overview of an overview is judged by the dataset the
+    caller opened: the wrapper's declared filter reaches the inner overview as
+    an open option, which alone would make it look changed there."""
+    tif = _fs_tile(str(tmp_vsimem / "composite.tif"), 2, 82, 4, 99)
+    ovr = _fs_items(
+        tmp_vsimem,
+        "ovr",
+        2,
+        (11, 12),
+        metadata=_fs_tier_md(2) | {"OVERVIEW_0_DATASET": tif},
+    )
+    mosaic = _fs_mosaic(
+        tmp_vsimem,
+        f"<Filter>cat &gt;= 1</Filter><Overview><Dataset>GTI:{ovr}</Dataset></Overview>",
+    )
+    assert _fs_read(_fs_open(mosaic), factor=8) == (99, 99)
+    assert _fs_read(_fs_open(mosaic, "FILTER=cat = 2"), factor=8) == (0, 12)
+
+
+def test_gti_filter_sort_materialized_requires_dataset(tmp_vsimem):
+    """An overview without <Dataset> is the tile index itself: it cannot be
+    materialized."""
+    mosaic = _fs_mosaic(
+        tmp_vsimem,
+        "<Overview><Factor>2</Factor><Materialized>true</Materialized></Overview>",
+    )
+    with pytest.raises(Exception, match="Materialized is only allowed"):
+        _fs_open(mosaic)
+
+
+def test_gti_filter_sort_internal_option_stays_internal(tmp_vsimem):
+    """The option telling an overview whether the caller kept the declared
+    filter and sort order reaches that overview's own implicit levels without
+    being validated as a user option ("does not support open option")."""
+    ovr = _fs_items(
+        tmp_vsimem,
+        "ovr",
+        2,
+        (11, 12),
+        metadata=_fs_tier_md(2) | {"OVERVIEW_0_FACTOR": "2"},
+    )
+    mosaic = _fs_mosaic(tmp_vsimem, f"<Overview><Dataset>GTI:{ovr}</Dataset></Overview>")
+    ds = _fs_open(mosaic)
+    with gdal.quiet_errors():
+        gdal.ErrorReset()
+        assert ds.GetRasterBand(1).GetOverviewCount() == 2
+        assert gdal.GetLastErrorMsg() == ""
+    assert _fs_read(ds, factor=8) == (11, 12)
