@@ -543,7 +543,8 @@ also defined as layer metadata items or in the .gti XML file
       tiles are composited, when they overlap (z-order). That field may be of
       type String, Integer, Integer64, Date or DateTime. By default, the higher the
       value in that field, the last the corresponding tile will be rendered in the
-      virtual mosaic (unless SORT_FIELD_ASC=NO is set)
+      virtual mosaic (unless SORT_FIELD_ASC=NO is set). An empty value means no
+      sort field, also when the XML file or layer metadata declare one.
 
 -  .. oo:: SORT_FIELD_ASC
       :choices: YES, NO
@@ -585,6 +586,8 @@ also defined as layer metadata items or in the .gti XML file
       :choices: <string>
 
       Value of a SQL WHERE clause, used to select a subset of the features of the index.
+      An empty value means no filter, also when the XML file or layer metadata
+      declare one. Overview levels follow it: see :ref:`raster.gti.overview.filter_sort`.
 
 -  .. oo:: RESX
       :choices: <float>
@@ -672,32 +675,33 @@ than the previously added overview.
 Overviews, FILTER and SORT_FIELD
 ++++++++++++++++++++++++++++++++
 
-An overview level is the same virtual mosaic at a lower resolution. The tiles
-selected by ``FILTER`` and the order given by ``SORT_FIELD`` and
-``SORT_FIELD_ASC``, whether they come from open options, the XML file or layer
-metadata, therefore apply to overview levels too:
+An overview level is the same virtual mosaic at a lower resolution, so the tiles
+selected by ``FILTER`` and the order given by ``SORT_FIELD`` and ``SORT_FIELD_ASC``
+(the dataset's, from its open options, XML file or layer metadata) apply to the
+overview levels too:
 
-- An overview level that is the tile index itself (``<Factor>`` and/or
-  ``<Layer>`` without ``<Dataset>``), and a ``<Dataset>`` that is itself a GTI
-  dataset, are opened with the ``FILTER`` and sort order of the dataset. A
-  ``FILTER`` in the level's own ``<OpenOptions>`` is combined with the dataset's as
-  ``(dataset filter) AND (level filter)``; the dataset's sort order replaces the
-  level's own.
-- A ``<Dataset>`` that is a GTI dataset is also given the extent of the dataset
+- **They belong to the dataset.** An overview level that is a tile index, whether
+  the tile index itself (``<Factor>`` and/or ``<Layer>`` without ``<Dataset>``)
+  or a ``<Dataset>`` that is a GTI dataset, is opened with the dataset's
+  ``FILTER`` and sort order, also when the dataset has none. ``FILTER``,
+  ``SORT_FIELD`` and ``SORT_FIELD_ASC`` in an overview's own ``<OpenOptions>`` are
+  ignored, with a warning, and those a GTI overview declares itself do not apply.
+  An overview that needs to restrict its tiles defines that in its own index
+  (``<SQL>``, its own layer). A GTI overview is also given the dataset's extent
   (``MINX``, ``MINY``, ``MAXX``, ``MAXY``), unless its ``<OpenOptions>`` set it.
-- A ``<Dataset>`` that is not a GTI dataset (a GeoTIFF, ...), or a GTI dataset
-  declared with ``<Materialized>true</Materialized>`` (layer metadata
-  ``OVERVIEW_<idx>_MATERIALIZED=YES``), is *materialized*: its pixels were
-  composited ahead of time, with the filter and sort order the dataset
-  declares. It is only used when the dataset is opened with those, that is when
-  no open option changes ``FILTER``, ``SORT_FIELD`` or ``SORT_FIELD_ASC``.
-- A ``FILTER`` that uses the FID or the location field, whose values differ from
-  one tile index to another, or that the OGR SQL parser cannot analyze, is not
-  applied to ``<Dataset>`` overviews: they are not used, and downsampled requests
-  are served by the tile index itself and its implicit levels.
-- When the dataset is opened with a filter or sort order other than the declared ones, a
-  ``<Dataset>`` GTI overview that cannot be opened with it (for example because
-  it lacks the sort field) is not used, with a warning.
+- **Materialized overviews are only used as declared.** A ``<Dataset>`` that is
+  not a GTI dataset (a GeoTIFF, a VRT, ...), or a GTI dataset declared with
+  ``<Materialized>true</Materialized>`` (layer metadata
+  ``OVERVIEW_<idx>_MATERIALIZED=YES``), holds pixels composited ahead of time with
+  the declared filter and sort order. It is not used when the dataset is opened
+  with a ``FILTER``, ``SORT_FIELD`` or ``SORT_FIELD_ASC`` open option.
+- **Row identity stays in its index.** A ``FILTER`` that uses the FID or the
+  location field selects rows of this tile index only: ``<Dataset>`` overviews
+  are not used for it, and downsampled requests are served by the tile index
+  itself and its implicit levels.
+- When the dataset is opened with a ``FILTER`` or sort order of its own, a
+  ``<Dataset>`` GTI overview that cannot apply it (for example because it lacks
+  one of its fields) is not used, with a warning.
 
 The ``__DEBUG__`` metadata item ``OVERVIEWS_SKIPPED`` lists the overview levels
 not used, as ``<index>:<reason>``, reasons ``materialized``, ``index-local``,
@@ -817,7 +821,9 @@ an integer index (starting at 0 since GDAL 3.9.2, starting at 1 in previous vers
 
 * ``OVERVIEW_<idx>_OPEN_OPTIONS=<key1=value1>[,key2=value2]...``
 
-  Open options(s) to use to open ``OVERVIEW_<idx>_DATASET``.
+  Open options(s) to use to open ``OVERVIEW_<idx>_DATASET``. ``FILTER``,
+  ``SORT_FIELD`` and ``SORT_FIELD_ASC`` are ignored there: see
+  :ref:`raster.gti.overview.filter_sort`.
 
 * ``OVERVIEW_<idx>_LAYER=<string>``
 

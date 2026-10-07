@@ -246,7 +246,6 @@ class GDALTileIndexDataset final : public GDALPamDataset
   private:
     friend class GDALTileIndexBand;
 
-    void SetOverviewFilterAndSort(CPLStringList &aosOptions) const;
     void SetOverviewExtent(CPLStringList &aosOptions) const;
     bool IsFilterIndexLocal() const;
     void SkipOverview(int iOvr, const std::string &osName,
@@ -371,9 +370,9 @@ class GDALTileIndexDataset final : public GDALPamDataset
     //! Name of the effective SORT_FIELD, empty if none.
     std::string m_osSortFieldName{};
 
-    //! Whether the dataset the caller opened is as declared: no open option
-    //! changes its FILTER, SORT_FIELD or SORT_FIELD_ASC. A materialized
-    //! overview only shows the declared ones.
+    //! Whether the dataset the caller opened uses its declared FILTER and sort
+    //! order: none of FILTER, SORT_FIELD, SORT_FIELD_ASC was given to it as an
+    //! open option. Materialized overviews are only used then.
     bool m_bDeclaredFilterAndSort = true;
 
     //! Name of the location field.
@@ -399,10 +398,9 @@ class GDALTileIndexDataset final : public GDALPamDataset
 
     //! Array of overview descriptors.
     //! Each descriptor is a tuple (dataset_name, concatenated_open_options,
-    //! layer_name, overview_factor, materialized), materialized being unset
-    //! unless <Materialized> / OVERVIEW_<idx>_MATERIALIZED is given.
-    std::vector<std::tuple<std::string, CPLStringList, std::string, double,
-                           std::optional<bool>>>
+    //! layer_name, overview_factor, declared_materialized).
+    std::vector<
+        std::tuple<std::string, CPLStringList, std::string, double, bool>>
         m_aoOverviewDescriptor{};
 
     //! Array of overview datasets.
@@ -895,10 +893,6 @@ GTIDoPaletteExpansionIfNeeded(std::shared_ptr<GDALDataset> &poTileDS,
 }
 
 /************************************************************************/
-/*                                Open()                                */
-/************************************************************************/
-
-/************************************************************************/
 /*                    g_poParentForImplicitOverview                     */
 /************************************************************************/
 
@@ -912,6 +906,10 @@ GTIDoPaletteExpansionIfNeeded(std::shared_ptr<GDALDataset> &poTileDS,
 // time (a level is only read from within the parent's RasterIO).
 static thread_local GDALTileIndexDataset *g_poParentForImplicitOverview =
     nullptr;
+
+/************************************************************************/
+/*                                Open()                                */
+/************************************************************************/
 
 bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
 {
@@ -1233,14 +1231,10 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
     // - open options
     // - XML file
     // - Layer metadata items.
-    const auto GetOption = [poOpenInfo, psRoot,
-                            this](const char *pszItem,
-                                  bool bWithOpenOptions = true)
+    const auto GetOption = [poOpenInfo, psRoot, this](const char *pszItem)
     {
         const char *pszVal =
-            bWithOpenOptions
-                ? CSLFetchNameValue(poOpenInfo->papszOpenOptions, pszItem)
-                : nullptr;
+            CSLFetchNameValue(poOpenInfo->papszOpenOptions, pszItem);
         if (pszVal)
             return pszVal;
 
@@ -1292,8 +1286,10 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
         m_poLayer->ResetReading();
     }
 
+    // An empty FILTER or SORT_FIELD means none: an overview is given the
+    // dataset's, also when the dataset has none.
     const char *pszFilter = GetOption("Filter");
-    if (pszFilter)
+    if (pszFilter && pszFilter[0])
     {
         if (m_poLayer->SetAttributeFilter(pszFilter) != OGRERR_NONE)
             return false;
@@ -1397,7 +1393,7 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
     }
 
     const char *pszSortFieldName = GetOption(MD_SORT_FIELD);
-    if (pszSortFieldName)
+    if (pszSortFieldName && pszSortFieldName[0])
     {
         m_nSortFieldIndex = poLayerDefn->GetFieldIndex(pszSortFieldName);
         if (m_nSortFieldIndex < 0)
@@ -1427,11 +1423,9 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
         }
     }
 
-    // Whether the caller kept the declared FILTER and sort order. An overview
-    // we open for a parent is told the answer of the dataset the caller opened
-    // (the parent's filter and sort order reach it as open options, which
-    // alone would look like a change). Set as @DECLARED_FILTER_AND_SORT;
-    // GDALOpenEx() strips the '@' of internal options.
+    // An overview is told the answer of the dataset the caller opened: the
+    // FILTER and sort order it is given arrive as open options too.
+    // (@DECLARED_FILTER_AND_SORT: GDALOpenEx() strips the '@'.)
     if (const char *pszDeclared = CSLFetchNameValue(
             poOpenInfo->papszOpenOptions, "DECLARED_FILTER_AND_SORT"))
     {
@@ -1439,19 +1433,10 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
     }
     else
     {
-        const char *pszDeclaredFilter = GetOption("Filter", false);
-        const char *pszDeclaredSortField = GetOption(MD_SORT_FIELD, false);
-        const char *pszDeclaredSortFieldAsc =
-            GetOption(MD_SORT_FIELD_ASC, false);
         m_bDeclaredFilterAndSort =
-            CPLString(m_osFilter).Trim() ==
-                CPLString(pszDeclaredFilter ? pszDeclaredFilter : "").Trim() &&
-            EQUAL(m_osSortFieldName.c_str(),
-                  pszDeclaredSortField ? pszDeclaredSortField : "") &&
-            (m_osSortFieldName.empty() ||
-             m_bSortFieldAsc ==
-                 CPLTestBool(pszDeclaredSortFieldAsc ? pszDeclaredSortFieldAsc
-                                                     : "YES"));
+            !CSLFetchNameValue(poOpenInfo->papszOpenOptions, "FILTER") &&
+            !CSLFetchNameValue(poOpenInfo->papszOpenOptions, MD_SORT_FIELD) &&
+            !CSLFetchNameValue(poOpenInfo->papszOpenOptions, MD_SORT_FIELD_ASC);
     }
 
     const char *pszResX = GetOption(MD_RESX);
@@ -2772,16 +2757,13 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
                                  GTI_XML_OVERVIEW_DATASET);
                         return false;
                     }
-                    std::optional<bool> oMaterialized;
-                    if (pszMaterialized)
-                        oMaterialized = CPLTestBool(pszMaterialized);
-
                     m_aoOverviewDescriptor.emplace_back(
                         std::string(pszDataset ? pszDataset : ""),
                         CPLStringList(
                             GDALDeserializeOpenOptionsFromXML(psIter)),
                         std::string(pszLayer ? pszLayer : ""),
-                        pszFactor ? CPLAtof(pszFactor) : 0.0, oMaterialized);
+                        pszFactor ? CPLAtof(pszFactor) : 0.0,
+                        pszMaterialized && CPLTestBool(pszMaterialized));
                 }
             }
         }
@@ -2815,16 +2797,14 @@ bool GDALTileIndexDataset::Open(GDALOpenInfo *poOpenInfo)
                              iOvr, iOvr);
                     return false;
                 }
-                std::optional<bool> oMaterialized;
-                if (pszOvrMaterialized)
-                    oMaterialized = CPLTestBool(pszOvrMaterialized);
                 m_aoOverviewDescriptor.emplace_back(
                     std::string(pszOvrDSName ? pszOvrDSName : ""),
                     pszOpenOptions ? CPLStringList(CSLTokenizeString2(
                                          pszOpenOptions, ",", 0))
                                    : CPLStringList(),
                     std::string(pszOvrLayer ? pszOvrLayer : ""),
-                    pszOvrFactor ? CPLAtof(pszOvrFactor) : 0.0, oMaterialized);
+                    pszOvrFactor ? CPLAtof(pszOvrFactor) : 0.0,
+                    pszOvrMaterialized && CPLTestBool(pszOvrMaterialized));
             }
         }
     }
@@ -3309,35 +3289,6 @@ static bool IsTileIndexOverviewDataset(const std::string &osDSName)
 }
 
 /************************************************************************/
-/*                      SetOverviewFilterAndSort()                      */
-/************************************************************************/
-
-//! Set the FILTER and sort order an overview that is a tile index must
-//! follow: our filter AND the overview's own, and our sort order. An overview
-//! is the same mosaic at a lower resolution, so it selects and stacks tiles
-//! as we do.
-void GDALTileIndexDataset::SetOverviewFilterAndSort(
-    CPLStringList &aosOptions) const
-{
-    if (!m_osFilter.empty())
-    {
-        const char *pszOwnFilter = aosOptions.FetchNameValue("FILTER");
-        // std::string, not CPLSPrintf: a filter can be longer than its buffer
-        const std::string osFilter =
-            pszOwnFilter && pszOwnFilter[0]
-                ? "(" + m_osFilter + ") AND (" + std::string(pszOwnFilter) + ")"
-                : m_osFilter;
-        aosOptions.SetNameValue("FILTER", osFilter.c_str());
-    }
-    if (!m_osSortFieldName.empty())
-    {
-        aosOptions.SetNameValue(MD_SORT_FIELD, m_osSortFieldName.c_str());
-        aosOptions.SetNameValue(MD_SORT_FIELD_ASC,
-                                m_bSortFieldAsc ? "YES" : "NO");
-    }
-}
-
-/************************************************************************/
 /*                         SetOverviewExtent()                          */
 /************************************************************************/
 
@@ -3367,36 +3318,32 @@ void GDALTileIndexDataset::SetOverviewExtent(CPLStringList &aosOptions) const
 /*                         IsFilterIndexLocal()                         */
 /************************************************************************/
 
-//! Whether our filter only means something in this very index: it references
-//! the FID or the location field, whose values differ from one tile index to
-//! another, or OGR SQL cannot parse it, so what it references is unknown.
+//! Whether our filter only means something in this very index: it uses the
+//! FID or the location field, whose values differ from one tile index to
+//! another. Looked up as whole words of the filter, so that it holds for any
+//! SQL dialect and length; a word inside a string literal errs on the safe side.
 bool GDALTileIndexDataset::IsFilterIndexLocal() const
 {
-    if (m_osFilter.empty())
+    const auto IsIdentifierChar = [](char c)
+    { return isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+    const auto UsesWord = [this, &IsIdentifierChar](const char *pszWord)
+    {
+        const size_t nLen = strlen(pszWord);
+        for (size_t i = 0; nLen && i + nLen <= m_osFilter.size(); ++i)
+        {
+            if (EQUALN(m_osFilter.c_str() + i, pszWord, nLen) &&
+                (i == 0 || !IsIdentifierChar(m_osFilter[i - 1])) &&
+                (i + nLen == m_osFilter.size() ||
+                 !IsIdentifierChar(m_osFilter[i + nLen])))
+            {
+                return true;
+            }
+        }
         return false;
-    OGRFeatureQuery oQuery;
-    {
-        CPLErrorStateBackuper oBackuper(CPLQuietErrorHandler);
-        if (oQuery.Compile(m_poLayer, m_osFilter.c_str()) != OGRERR_NONE)
-        {
-            CPLDebug("GTI", "Cannot tell which fields filter '%.200s' uses: %s",
-                     m_osFilter.c_str(), CPLGetLastErrorMsg());
-            return true;
-        }
-    }
-    const CPLStringList aosFields(oQuery.GetUsedFields());
+    };
     const char *pszFIDColumn = m_poLayer->GetFIDColumn();
-    for (const char *pszField : aosFields)
-    {
-        if (EQUAL(pszField, "FID") ||
-            (pszFIDColumn && pszFIDColumn[0] &&
-             EQUAL(pszField, pszFIDColumn)) ||
-            EQUAL(pszField, m_osLocationFieldName.c_str()))
-        {
-            return true;
-        }
-    }
-    return false;
+    return UsesWord("FID") || (pszFIDColumn && UsesWord(pszFIDColumn)) ||
+           UsesWord(m_osLocationFieldName.c_str());
 }
 
 /************************************************************************/
@@ -3506,44 +3453,56 @@ void GDALTileIndexDataset::LoadOverviews()
         m_bOverviewsLoaded = true;
         int iOvrDesc = -1;
         for (const auto &[osDSName, aosOpenOptions, osLyrName, dfFactor,
-                          oMaterialized] : m_aoOverviewDescriptor)
+                          bDeclaredMaterialized] : m_aoOverviewDescriptor)
         {
             ++iOvrDesc;
             CPLStringList aosNewOpenOptions(aosOpenOptions);
+            // FILTER and the sort order are the dataset's (set below).
+            for (const char *pszKey :
+                 {"FILTER", MD_SORT_FIELD, MD_SORT_FIELD_ASC})
+            {
+                if (aosNewOpenOptions.FetchNameValue(pszKey))
+                {
+                    CPLError(CE_Warning, CPLE_AppDefined,
+                             "%s ignored in the open options of overview %d: "
+                             "the FILTER and sort order of overviews are the "
+                             "dataset's",
+                             pszKey, iOvrDesc);
+                    aosNewOpenOptions.SetNameValue(pszKey, nullptr);
+                }
+            }
             if (dfFactor != 0)
             {
                 aosNewOpenOptions.SetNameValue("@FACTOR",
                                                CPLSPrintf("%.17g", dfFactor));
             }
+            if (!osLyrName.empty())
+            {
+                aosNewOpenOptions.SetNameValue("@LAYER", osLyrName.c_str());
+            }
             if (osDSName.empty())
             {
                 // Implicit overview of this very dataset: inherit our open
-                // options (MASK_BAND, ...). Options defining the resolution
-                // are replaced by @FACTOR; FILTER, SORT_FIELD and
-                // SORT_FIELD_ASC are set below, as for every overview
-                // that is a tile index.
+                // options (MASK_BAND, ...), except those defining the
+                // resolution, replaced by @FACTOR, and those the level sets
+                // itself, also as @FACTOR / @LAYER (GDALOpenEx() stores ours
+                // without the '@').
                 for (const auto &[pszKey, pszValue] : cpl::IterateNameValue(
                          static_cast<CSLConstList>(GetOpenOptions())))
                 {
                     if (EQUAL(pszKey, MD_RESX) || EQUAL(pszKey, MD_RESY) ||
                         EQUAL(pszKey, MD_XSIZE) || EQUAL(pszKey, MD_YSIZE) ||
                         EQUAL(pszKey, MD_GEOTRANSFORM) ||
-                        EQUAL(pszKey, "FILTER") ||
-                        EQUAL(pszKey, MD_SORT_FIELD) ||
-                        EQUAL(pszKey, MD_SORT_FIELD_ASC) ||
                         EQUAL(pszKey, "DECLARED_FILTER_AND_SORT") ||
                         STARTS_WITH_CI(pszKey, "OVERVIEW_") ||
-                        STARTS_WITH_CI(pszKey, "@") ||
-                        aosNewOpenOptions.FetchNameValue(pszKey))
+                        aosNewOpenOptions.FetchNameValue(pszKey) ||
+                        aosNewOpenOptions.FetchNameValue(
+                            CPLSPrintf("@%s", pszKey)))
                     {
                         continue;
                     }
                     aosNewOpenOptions.SetNameValue(pszKey, pszValue);
                 }
-            }
-            if (!osLyrName.empty())
-            {
-                aosNewOpenOptions.SetNameValue("@LAYER", osLyrName.c_str());
             }
 
             std::string osResolvedDSName(osDSName);
@@ -3570,85 +3529,62 @@ void GDALTileIndexDataset::LoadOverviews()
             }
 
             // An implicit level is this very index; a <Dataset> that is a
-            // tile index is the same mosaic at a coarser resolution. Both
-            // show the mosaic with our filter and sort order, over our extent.
+            // tile index is the same mosaic at a coarser resolution. Any other
+            // raster, or a tile index declared so, is materialized: composited
+            // ahead of time with the declared FILTER and sort order.
             const bool bImplicit = osResolvedDSName.empty();
-            // Declared materialized and not usable now: no need to look at it.
-            const bool bSkipUnseen =
-                oMaterialized.value_or(false) && !m_bDeclaredFilterAndSort;
             const bool bTileIndex =
-                bImplicit ||
-                (!bSkipUnseen && IsTileIndexOverviewDataset(osResolvedDSName));
-            if (!bTileIndex && !bSkipUnseen && oMaterialized.has_value())
-            {
-                CPLError(CE_Warning, CPLE_AppDefined,
-                         "%s=false ignored for %s: a raster that is not "
-                         "a tile index is always materialized",
-                         GTI_XML_OVERVIEW_MATERIALIZED,
-                         osResolvedDSName.c_str());
-            }
-            // A <Dataset> that is not a tile index is materialized: its
-            // pixels were composited ahead of time, with the declared filter
-            // and sort order.
-            const bool bMaterialized =
-                oMaterialized.value_or(false) || !bTileIndex;
+                bImplicit || IsTileIndexOverviewDataset(osResolvedDSName);
+            const bool bMaterialized = bDeclaredMaterialized || !bTileIndex;
             if (bMaterialized && !m_bDeclaredFilterAndSort)
             {
                 SkipOverview(iOvrDesc, osResolvedDSName, "materialized",
-                             "it only shows the declared filter and sort "
-                             "order",
+                             "it was composited with the declared FILTER and "
+                             "sort order",
                              false);
                 continue;
             }
             if (!bImplicit && !bMaterialized && IsFilterIndexLocal())
             {
                 SkipOverview(iOvrDesc, osResolvedDSName, "index-local",
-                             "the filter only has a meaning in this tile "
-                             "index (it uses the FID or the location field, "
-                             "or OGR SQL cannot parse it)",
+                             "the FILTER uses the FID or the location field, "
+                             "whose values differ between tile indexes",
                              m_bDeclaredFilterAndSort);
                 continue;
             }
-            if (!bMaterialized)
-                SetOverviewFilterAndSort(aosNewOpenOptions);
-            if (bImplicit && !aosNewOpenOptions.FetchNameValue("FILTER"))
-            {
-                // The level reads our XML again: without a FILTER it would
-                // apply the declared <Filter> even where an empty FILTER open
-                // option cleared ours.
-                aosNewOpenOptions.SetNameValue("FILTER", "");
-            }
             if (bTileIndex)
-            {
                 SetOverviewExtent(aosNewOpenOptions);
+            if (!bMaterialized)
+            {
+                // The same mosaic at a lower resolution: it selects and
+                // stacks tiles as we do, whatever it declares itself, also
+                // when we have no FILTER or sort order.
+                aosNewOpenOptions.SetNameValue("FILTER", m_osFilter.c_str());
+                aosNewOpenOptions.SetNameValue(MD_SORT_FIELD,
+                                               m_osSortFieldName.c_str());
+                aosNewOpenOptions.SetNameValue(MD_SORT_FIELD_ASC,
+                                               m_bSortFieldAsc ? "YES" : "NO");
                 aosNewOpenOptions.SetNameValue(
                     "@DECLARED_FILTER_AND_SORT",
                     m_bDeclaredFilterAndSort ? "YES" : "NO");
             }
-            if (bImplicit)
+            if (bImplicit && m_poVectorDS &&
+                !aosNewOpenOptions.FetchNameValue("SQL"))
             {
                 // Hand over the opened index dataset (see
                 // g_poParentForImplicitOverview), so that the level neither
                 // reconnects to the index nor queries the layer extent again.
                 // A <SQL> index hands over its result layer as well (see
                 // Open()). Not with a SQL open option: the level would
-                // re-execute that statement. Not when the level narrows the
-                // filter with its own: it would set that filter on the layer
-                // object it shares with us.
-                const char *pszLevelFilter =
-                    aosNewOpenOptions.FetchNameValue("FILTER");
-                if (m_poVectorDS && !aosNewOpenOptions.FetchNameValue("SQL") &&
-                    m_osFilter == (pszLevelFilter ? pszLevelFilter : ""))
-                {
-                    g_poParentForImplicitOverview = this;
-                }
+                // re-execute that statement.
+                g_poParentForImplicitOverview = this;
             }
             // With a requested filter or sort order, an overview that cannot
             // apply it (a missing field, ...) is left out with a warning: the
             // mosaic is still served, by the finer levels. As declared, a
             // failure stays an error: the index itself is misconfigured.
             const bool bFailureAsWarning =
-                !bImplicit && !bMaterialized && !m_bDeclaredFilterAndSort;
+                !bImplicit && !m_bDeclaredFilterAndSort;
             std::unique_ptr<GDALDataset, GDALDatasetUniquePtrReleaser> poOvrDS;
             {
                 // Around the open only: later failures (the overview's own
@@ -3676,7 +3612,7 @@ void GDALTileIndexDataset::LoadOverviews()
             // GeoPackage, PostgreSQL, ... accept a filter on a field they
             // lack and only fail when reading: find out now rather than serve
             // a blank level.
-            if (poOvrDS && !bImplicit && !bMaterialized && !m_osFilter.empty())
+            if (poOvrDS && !bImplicit && !bMaterialized)
             {
                 auto poOvrGTI =
                     dynamic_cast<GDALTileIndexDataset *>(poOvrDS.get());
